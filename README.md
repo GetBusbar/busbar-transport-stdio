@@ -5,7 +5,7 @@ First-party signed kind:transport plugin cdylib: the stdio transport, packaged a
 
 | kind | alias | crate | busbar | license |
 |---|---|---|---|---|
-| `transport` | `stdio` | `busbar-transport-stdio-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
+| `transport` | `stdio` | `busbar-transport-stdio-plugin` | 1.6.0 (pinned in `.busbar-ref`) | MIT |
 
 [![ci](https://github.com/GetBusbar/busbar-transport-stdio/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-transport-stdio/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
