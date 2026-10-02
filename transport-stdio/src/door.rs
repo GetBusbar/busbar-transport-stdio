@@ -491,7 +491,7 @@ impl Framing {
             }
         }
         o.set(|o| &o.yielded.frame_len, frame.asked() as u64);
-        o.set(|o| &o.yielded.pieces_len, pieces.asked() as u64);
+        o.set(|o| &o.yielded.pieces_len, pieces.asked() as u32);
         if !self.outbound.is_empty() {
             o.set(|o| &o.yielded.flags, YIELD_MORE);
             return Outcome::Ready;
