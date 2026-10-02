@@ -223,10 +223,6 @@ impl Host {
         assert_eq!(self.take(r, &o), Outcome::Ready);
         self.drain(slot::EMIT);
     }
-
-    fn joined(&self) -> Vec<u8> {
-        self.frames.iter().flat_map(|(b, _)| b.clone()).collect()
-    }
 }
 
 fn lines(h: &Host) -> Vec<Vec<u8>> {
