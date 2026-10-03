@@ -122,6 +122,7 @@ dependencies = [
  "busbar-contract",
  "busbar-plugin-loader",
  "busbar-transport-stdio",
+ "busbar-transport-stdio-plugin",
 ]
 
 [[package]]
