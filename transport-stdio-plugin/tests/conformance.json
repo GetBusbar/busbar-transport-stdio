@@ -1,0 +1,19 @@
+{
+  "settings": {},
+  "transport": {
+    "locate": "refused",
+    "dial": {
+      "emit": "to the far side",
+      "wire": "to the far side\n",
+      "ingest": "from the\r\n\nfar side\n",
+      "frames": ["from the", "far side"]
+    },
+    "encode": [
+      { "body": "body", "fields": [], "wire": "body" },
+      { "body": "body", "fields": [["a", "b"]], "wire": "body" },
+      { "body": "two\nlines", "fields": [], "wire": null }
+    ],
+    "refuse": { "bytes": "refused", "wire": "refused\n" },
+    "handoff": "refused"
+  }
+}
