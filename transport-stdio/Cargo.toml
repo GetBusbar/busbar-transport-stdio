@@ -5,7 +5,7 @@ version = "1.6.0"
 publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
 rust-version = "1.97"
-description = "The stdio transport: a line framer (one frame per 0x0A-terminated line) over the host's pipe."
+description = "The stdio transport: the carrier of a spawned program's pipes, one frame per line, over the host's I/O."
 license = "Apache-2.0"
 
 [lib]
