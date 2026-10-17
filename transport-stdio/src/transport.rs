@@ -37,9 +37,11 @@ use busbar_contract::abi::transport::{
     CANCEL_NOTHING_MOVED, DEST_PROGRAM, READ_END_OF_FRAME, WRITE_END_OF_FRAME,
 };
 
-/// The longest line this carrier frames, before its terminator: the design's per-connection
-/// reading budget (a line is one frame on this wire).
-pub const MAX_LINE_BYTES: usize = busbar_contract::MAX_CURSOR_BYTES;
+/// The longest line this carrier frames, before its terminator (a line is one frame on this
+/// wire): the bound the host holds one inbound frame of a byte channel to, its request-body bound
+/// (32 MiB), so a message the gateway would take through its front door crosses a stdio pipe
+/// whole. Past it the line is a framing fault, not a big frame, and the read fails.
+pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 
 /// The most bytes one connection holds queued for the program and not yet taken by its pipe: a
 /// `write` past it waits for the pipe to drain.
