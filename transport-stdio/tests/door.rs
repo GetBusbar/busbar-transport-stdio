@@ -495,3 +495,23 @@ fn a_buffered_line_and_a_whole_frame_allocate_nothing() {
     assert_eq!(n, 0, "writing a whole frame allocated {n} times");
     with(|sc| assert!(sc.written.ends_with(b"{\"id\":3}\n")));
 }
+
+/// A LINE OF 100 KiB IS ONE FRAME: the carrier's line bound is the host's own bound on one
+/// inbound frame of a byte channel (the request-body bound), not a 64 KiB cursor budget, so a
+/// stdio program's large message (a long tool list, a resource read carrying base64) is read whole.
+#[test]
+fn a_line_of_a_hundred_kib_is_one_frame() {
+    let _one = ONE.lock().unwrap();
+    let mut line = vec![b'x'; 100 * 1024];
+    line.push(b'\n');
+    let mut reads: Vec<Option<Vec<u8>>> =
+        line.chunks(16 * 1024).map(|c| Some(c.to_vec())).collect();
+    reads.push(None);
+    let h = Host::new(reads);
+    let (r, bytes, end, why) = h.read(200 * 1024);
+    assert_eq!(
+        (r, bytes.len(), end, why.as_str()),
+        (Outcome::Ready, 100 * 1024, true, ""),
+        "a 100 KiB line must be read as one frame"
+    );
+}
