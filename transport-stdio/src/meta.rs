@@ -7,7 +7,9 @@
 
 use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::mechanism::door::KindTailHead;
-use busbar_contract::abi::transport::{TransportTail, FRAMING_STREAM, ROLE_CARRIER};
+use busbar_contract::abi::transport::{
+    TransportTail, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_CARRIER,
+};
 
 /// The claim this entry answers for: the stdio row's key.
 pub const KEY: &str = "stdio";
@@ -29,6 +31,8 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     framing: FRAMING_STREAM,
     facts: 0,
     handshake_max_steps: 0,
+    frame_piece_size: FRAME_PIECE_SIZE,
+    _reserved: 0,
     composes_over: std::ptr::null(),
     composes_over_len: 0,
     claim_rows: crate::claims::CLAIMS.as_ptr(),
@@ -43,4 +47,6 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     status_rows_len: 0,
     settings: std::ptr::null(),
     settings_len: 0,
+    fault_rows: std::ptr::null(),
+    fault_rows_len: 0,
 };
