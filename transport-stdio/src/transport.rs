@@ -54,6 +54,17 @@ pub const TOO_LONG: &str = "a line ran past the stdio line ceiling without a new
 pub const NOT_ONE_LINE: &str =
     "a message holding a newline, or ending in a carriage return, is not one line";
 
+/// The line being answered, as positions in [`Conn::inbound`].
+#[derive(Clone, Copy)]
+struct Line {
+    /// The next byte to answer.
+    at: usize,
+    /// Where the line ends (its terminator excluded).
+    end: usize,
+    /// Where the bytes after it begin (its terminator included).
+    next: usize,
+}
+
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
 /// What one instance carries: its connections, each by the token it minted.
@@ -63,14 +74,19 @@ pub struct Carried {
 }
 
 /// One program's connection: the host's handle, the line being cut on the way in, the frame being
-/// gathered and the bytes queued on the way out.
+/// gathered and the bytes queued on the way out. A line is answered straight out of `inbound`, so
+/// the data path allocates nothing once its buffers are warm (THE DESIGN §11.2).
 #[derive(Default)]
 struct Conn {
     io: u64,
-    /// Bytes the program wrote, not yet cut into lines.
+    /// Bytes the program wrote; those before `head` are answered.
     inbound: Vec<u8>,
-    /// The line being answered, and how much of it is answered.
-    line: Option<(Vec<u8>, usize)>,
+    /// Where the bytes not yet answered begin in `inbound`.
+    head: usize,
+    /// How far `inbound` is known to hold no newline: the next scan starts there.
+    scanned: usize,
+    /// The line being answered.
+    line: Option<Line>,
     /// The program's output ended.
     ended: bool,
     /// The frame being written, gathered until its end.
@@ -149,26 +165,64 @@ macro_rules! over {
 }
 
 impl Conn {
-    /// The next whole line off `inbound` (the newline and a carriage return before it stripped);
-    /// at the program's end, the unterminated rest. `Err` for a line past [`MAX_LINE_BYTES`].
-    fn next_line(&mut self) -> Result<Option<Vec<u8>>, &'static str> {
-        match self.inbound.iter().position(|&b| b == b'\n') {
-            Some(at) => {
-                let mut line: Vec<u8> = self.inbound.drain(..=at).collect();
-                line.pop();
-                if line.last() == Some(&b'\r') {
-                    line.pop();
+    /// The next whole line in `inbound` (the newline and a carriage return before it stripped);
+    /// at the program's end, the unterminated rest. Scans only the bytes no earlier scan saw.
+    /// `Err` for a line past [`MAX_LINE_BYTES`].
+    fn next_line(&mut self) -> Result<Option<Line>, &'static str> {
+        let from = self.scanned.max(self.head);
+        match self.inbound[from..].iter().position(|&b| b == b'\n') {
+            Some(rel) => {
+                let newline = from + rel;
+                let mut end = newline;
+                if end > self.head && self.inbound[end - 1] == b'\r' {
+                    end -= 1;
                 }
-                if line.len() > MAX_LINE_BYTES {
+                if end - self.head > MAX_LINE_BYTES {
                     return Err(TOO_LONG);
                 }
-                Ok(Some(line))
+                self.scanned = newline + 1;
+                Ok(Some(Line {
+                    at: self.head,
+                    end,
+                    next: newline + 1,
+                }))
             }
-            None if self.inbound.len() > MAX_LINE_BYTES => Err(TOO_LONG),
-            None if self.ended && !self.inbound.is_empty() => {
-                Ok(Some(std::mem::take(&mut self.inbound)))
+            None => {
+                self.scanned = self.inbound.len();
+                let rest = self.inbound.len() - self.head;
+                if rest > MAX_LINE_BYTES {
+                    Err(TOO_LONG)
+                } else if self.ended && rest > 0 {
+                    Ok(Some(Line {
+                        at: self.head,
+                        end: self.inbound.len(),
+                        next: self.inbound.len(),
+                    }))
+                } else {
+                    Ok(None)
+                }
             }
-            None => Ok(None),
+        }
+    }
+
+    /// The line answered: the bytes after it are next. Answered bytes are dropped once nothing is
+    /// left after them, and moved out of the way before the next pipe read, keeping the buffer.
+    fn answered(&mut self, next: usize) {
+        self.line = None;
+        self.head = next;
+        if self.head == self.inbound.len() {
+            self.inbound.clear();
+            self.head = 0;
+            self.scanned = 0;
+        }
+    }
+
+    /// Room for the next pipe read: the answered bytes leave the front of `inbound`.
+    fn compact(&mut self) {
+        if self.head > 0 {
+            self.inbound.drain(..self.head);
+            self.scanned -= self.head.min(self.scanned);
+            self.head = 0;
         }
     }
 
@@ -249,12 +303,14 @@ impl SafeSlot for Read {
         over!(inst, o, i.conn, |io, c| {
             let mut buf = i.buf();
             loop {
-                if let Some((line, at)) = c.line.as_mut() {
-                    let n = buf.stream(&line[*at..]);
-                    *at += n;
-                    let done = *at == line.len();
+                if let Some(mut line) = c.line {
+                    let n = buf.stream(&c.inbound[line.at..line.end]);
+                    line.at += n;
+                    let done = line.at == line.end;
                     if done {
-                        c.line = None;
+                        c.answered(line.next);
+                    } else {
+                        c.line = Some(line);
                     }
                     o.set(|o| &o.len, n as u64);
                     o.set(|o| &o.flags, if done { READ_END_OF_FRAME } else { 0 });
@@ -262,7 +318,7 @@ impl SafeSlot for Read {
                 }
                 match c.next_line() {
                     Ok(Some(line)) => {
-                        c.line = Some((line, 0));
+                        c.line = Some(line);
                         continue;
                     }
                     Ok(None) if c.ended => {
@@ -272,6 +328,7 @@ impl SafeSlot for Read {
                     Ok(None) => {}
                     Err(why) => return o.fail(Refusal::failed(why)),
                 }
+                c.compact();
                 let mut chunk = [0_u8; READ_CHUNK];
                 match io.read(c.io, &mut chunk) {
                     Poll::Pending => return Outcome::Pending,
@@ -305,12 +362,17 @@ impl SafeSlot for Write {
             }
             c.message.extend_from_slice(bytes);
             if end {
-                let message = std::mem::take(&mut c.message);
-                if message.contains(&b'\n') || message.last() == Some(&b'\r') {
+                // The frame is checked and queued in place; its buffer is kept for the next one.
+                let c = &mut *c;
+                let one_line = !c.message.contains(&b'\n') && c.message.last() != Some(&b'\r');
+                if one_line {
+                    c.outbound.extend_from_slice(&c.message);
+                    c.outbound.push(b'\n');
+                }
+                c.message.clear();
+                if !one_line {
                     return o.fail(Refusal::failed(NOT_ONE_LINE));
                 }
-                c.outbound.extend_from_slice(&message);
-                c.outbound.push(b'\n');
                 if let Poll::Ready(Err(e)) = c.drain(&mut io) {
                     return o.fail(refusal(&e));
                 }
