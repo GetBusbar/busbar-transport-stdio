@@ -9,6 +9,8 @@
 //! `#![deny(unsafe_code)]`: driving a raw table is the host's side. The real host's I/O is driven by
 //! busbar's conformance suite (`tests/conformance.rs`).
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::sync::Mutex;
@@ -74,6 +76,61 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         std::ptr::from_mut(o).cast(),
     )
     .outcome()
+}
+
+// ── the allocation witness ───────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// Whether this thread's allocations are being counted.
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+    /// How many allocations this thread made while counting.
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The system allocator, counting the allocations a test thread makes while it is armed.
+struct Witness;
+
+impl Witness {
+    fn count() {
+        if COUNTING.try_with(Cell::get).unwrap_or(false) {
+            let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+        }
+    }
+}
+
+// SAFETY: every call is forwarded to `System` unchanged; the count touches only const thread-locals.
+unsafe impl GlobalAlloc for Witness {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        Self::count();
+        // SAFETY: the caller's contract, forwarded.
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        Self::count();
+        // SAFETY: the caller's contract, forwarded.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        Self::count();
+        // SAFETY: the caller's contract, forwarded.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the caller's contract, forwarded.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static WITNESS: Witness = Witness;
+
+/// How many allocations `f` makes on this thread.
+fn allocations<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    ALLOCATIONS.with(|n| n.set(0));
+    COUNTING.with(|c| c.set(true));
+    let r = f();
+    COUNTING.with(|c| c.set(false));
+    (r, ALLOCATIONS.with(Cell::get))
 }
 
 // ── the scripted host ────────────────────────────────────────────────────────────────────────────
@@ -224,6 +281,29 @@ impl Host {
         let r = call(ops().read, self.inst, &mut i, &mut o, slot::READ);
         buf.truncate(o.len as usize);
         (r, buf, o.flags & READ_END_OF_FRAME != 0, text(o.head.error))
+    }
+
+    /// A read into the caller's buffer: the outcome, the bytes answered and the frame bit, and no
+    /// allocation of its own.
+    fn read_into(&self, buf: &mut [u8]) -> (Outcome, usize, bool) {
+        let mut i: ReadIn = z();
+        i.conn = self.conn;
+        i.buf = buf.as_mut_ptr();
+        i.cap = buf.len();
+        let mut o: IoOut = z();
+        let r = call(ops().read, self.inst, &mut i, &mut o, slot::READ);
+        (r, o.len as usize, o.flags & READ_END_OF_FRAME != 0)
+    }
+
+    /// A write that ends its frame, with no allocation of its own.
+    fn write_frame(&self, bytes: &[u8]) -> Outcome {
+        let mut i: WriteIn = z();
+        i.conn = self.conn;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.flags = WRITE_END_OF_FRAME;
+        let mut o: IoOut = z();
+        call(ops().write, self.inst, &mut i, &mut o, slot::WRITE)
     }
 
     fn write(&self, bytes: &[u8], end: bool) -> (Outcome, String) {
@@ -383,5 +463,55 @@ fn shut_closes_the_program_and_an_authority_or_a_listen_is_refused() {
     assert_eq!(
         call(ops().listen, h.inst, &mut li, &mut lo, slot::LISTEN),
         Outcome::Refused
+    );
+}
+
+/// THE DATA PATH ALLOCATES NOTHING once a connection's buffers are warm (`BUSBAR-1.6.0.md` §11.2,
+/// "no allocation and no blocking on the hot path"): a line already read from the pipe is answered
+/// straight out of the carrier's buffer, and a whole frame is queued as its line without a fresh
+/// buffer per frame.
+#[test]
+fn a_buffered_line_and_a_whole_frame_allocate_nothing() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(vec![
+        Some(b"the first line, which warms the buffer\n{\"id\":2}\nthird\n".to_vec()),
+        None,
+    ]);
+    with(|sc| sc.written.reserve(4096));
+    let mut buf = [0_u8; 256];
+    assert_eq!(h.read_into(&mut buf), (Outcome::Ready, 38, true));
+    assert_eq!(
+        h.write_frame(b"a frame longer than the one measured, which warms the queue"),
+        Outcome::Ready
+    );
+
+    let (read, n) = allocations(|| h.read_into(&mut buf));
+    assert_eq!(read, (Outcome::Ready, 8, true));
+    assert_eq!(&buf[..8], b"{\"id\":2}");
+    assert_eq!(n, 0, "reading a line already buffered allocated {n} times");
+
+    let (wrote, n) = allocations(|| h.write_frame(b"{\"id\":3}"));
+    assert_eq!(wrote, Outcome::Ready);
+    assert_eq!(n, 0, "writing a whole frame allocated {n} times");
+    with(|sc| assert!(sc.written.ends_with(b"{\"id\":3}\n")));
+}
+
+/// A LINE OF 100 KiB IS ONE FRAME: the carrier's line bound is the host's own bound on one
+/// inbound frame of a byte channel (the request-body bound), not a 64 KiB cursor budget, so a
+/// stdio program's large message (a long tool list, a resource read carrying base64) is read whole.
+#[test]
+fn a_line_of_a_hundred_kib_is_one_frame() {
+    let _one = ONE.lock().unwrap();
+    let mut line = vec![b'x'; 100 * 1024];
+    line.push(b'\n');
+    let mut reads: Vec<Option<Vec<u8>>> =
+        line.chunks(16 * 1024).map(|c| Some(c.to_vec())).collect();
+    reads.push(None);
+    let h = Host::new(reads);
+    let (r, bytes, end, why) = h.read(200 * 1024);
+    assert_eq!(
+        (r, bytes.len(), end, why.as_str()),
+        (Outcome::Ready, 100 * 1024, true, ""),
+        "a 100 KiB line must be read as one frame"
     );
 }
