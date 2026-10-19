@@ -533,8 +533,16 @@ impl SafeSlot for Shut {
         if let Some(held) = gone {
             let mut conn = lock(&held);
             // A member's program found ENDED at its shut (the host's lease found it exited) is an
-            // end; one still running (its output PENDING) is a clean shut, no end.
-            if conn.key != 0 && !conn.counted && !conn.ended && found_ended(&mut io, conn.io) {
+            // end: the host answers the program's own exit first (`io.ends`), so a descendant still
+            // holding its output does not hide it; a host that predates that answer leaves the
+            // pipe's end to tell. One still running (exit not answered, output PENDING) is a
+            // clean shut, no end.
+            if conn.key != 0
+                && !conn.counted
+                && !conn.ended
+                && (matches!(io.program_exit(conn.io), Ok(Some(_)))
+                    || found_ended(&mut io, conn.io))
+            {
                 conn.ended = true;
             }
             if conn.ended {
