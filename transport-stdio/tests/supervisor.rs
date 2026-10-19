@@ -91,6 +91,8 @@ struct Script {
     spawns: u32,
     /// Whether `clock.now` fails.
     clock_fails: bool,
+    /// Whether `io.ends` finds the program itself exited (a descendant may still hold its pipe).
+    exited: bool,
 }
 
 static SCRIPT: Mutex<Script> = Mutex::new(Script {
@@ -100,6 +102,7 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     next_handle: 1,
     spawns: 0,
     clock_fails: false,
+    exited: false,
 });
 static ONE: Mutex<()> = Mutex::new(());
 
@@ -146,6 +149,15 @@ extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
     answer(out, Outcome::Ready, 0, 0)
 }
 
+extern "C" fn io_ends(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    let exited = with(|sc| sc.exited);
+    // SAFETY: the carrier's `out`, live for the call.
+    unsafe {
+        (*out).exited = u8::from(exited);
+    }
+    answer(out, Outcome::Ready, if exited { 3 } else { 0 }, 0)
+}
+
 extern "C" fn clock_now(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     if with(|sc| sc.clock_fails) {
         return answer(out, Outcome::Failed, 0, 0);
@@ -171,7 +183,7 @@ static IO: IoSlots = IoSlots {
     shut: None,
     close: Some(io_close),
     spawn: Some(io_spawn),
-    ends: None,
+    ends: Some(io_ends),
 };
 
 fn services() -> &'static HostSlots {
@@ -200,6 +212,7 @@ impl Carrier {
             next_handle: 1,
             spawns: 0,
             clock_fails: false,
+            exited: false,
         };
         let tables = Box::new(HostTables {
             size: size_of::<HostTables>() as u32,
@@ -449,5 +462,26 @@ fn an_end_met_without_a_clock_is_counted_once_the_clock_answers() {
         c.dial(60, "a").0,
         Outcome::Refused,
         "the end was counted at the shut"
+    );
+}
+
+/// A program that exited while a descendant still holds its output is an end: the read of its pipe
+/// pends, but `io.ends` answers its own exit, and the shut counts it (core's supervisor counted it
+/// through the host's own exit check). RED (Q128 transport-stdio LOW): the shut read only the pipe.
+#[test]
+fn a_program_that_exited_while_a_descendant_holds_its_pipe_is_an_end() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    let (r, conn) = c.dial(70, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.exited = true;
+    });
+    c.shut(conn);
+    assert_eq!(
+        c.dial(70, "a").0,
+        Outcome::Refused,
+        "the exit was counted at the shut"
     );
 }
