@@ -15,9 +15,10 @@
 //!   line past [`MAX_LINE_BYTES`] fails the read. At the program's end a final unterminated line
 //!   is a frame, then the clean end (`len` `0`, no frame bit).
 //! * `write` gathers a frame's bytes until `WRITE_END_OF_FRAME`, then queues them as ONE line, the
-//!   `0x0A` appended. A frame holding a newline, or ending in a carriage return, cannot be one line
-//!   and is refused before a byte of it is written. What the pipe has not taken is written by the
-//!   next `write` or `flush`.
+//!   `0x0A` appended. A frame holding a newline, or ending in a carriage return, cannot be one line,
+//!   and a frame past [`MAX_LINE_BYTES`] is no line either: each FAILS before a byte of it is
+//!   written (the carrier refuses to carry it; the contract's carrier script states FAILED for
+//!   such a frame). What the pipe has not taken is written by the next `write` or `flush`.
 //! * `flush` writes what is queued; `shut` closes the handle (the host kills the program) and
 //!   forgets the connection; `arrival` answers no far end and no port.
 //! * THE SUPERVISOR is this carrier's (THE DESIGN §2, l.388; [`crate::supervisor`]): a dial for a
@@ -83,9 +84,9 @@ fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
 
 /// Why a read fails.
 pub const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
-/// Why a write is refused when the frame it gathers passes the line ceiling.
+/// Why a write fails when the frame it gathers passes the line ceiling.
 pub const FRAME_TOO_LONG: &str = "a frame ran past the stdio line ceiling";
-/// Why a write is refused.
+/// Why a write fails when its frame cannot be one line.
 pub const NOT_ONE_LINE: &str =
     "a message holding a newline, or ending in a carriage return, is not one line";
 
@@ -261,7 +262,10 @@ impl Conn {
             None => {
                 self.scanned = self.inbound.len();
                 let rest = self.inbound.len() - self.head;
-                if rest > MAX_LINE_BYTES {
+                // A carriage return at the end may be the CR of a CRLF whose LF has not arrived:
+                // it is the terminator's, not the line's.
+                let pending_cr = usize::from(self.inbound.last() == Some(&b'\r'));
+                if rest > MAX_LINE_BYTES + pending_cr {
                     Err(TOO_LONG)
                 } else if self.ended && rest > 0 {
                     Ok(Some(Line {
@@ -301,7 +305,15 @@ impl Conn {
     fn drain(&mut self, io: &mut Io<'_>) -> Poll<Result<(), IoFailure>> {
         while self.sent < self.outbound.len() {
             match io.write(self.io, &self.outbound[self.sent..]) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // What the pipe took leaves the queue now, not only once it empties: under
+                    // sustained backpressure the queue holds only the bytes still owed.
+                    if self.sent > 0 {
+                        self.outbound.drain(..self.sent);
+                        self.sent = 0;
+                    }
+                    return Poll::Pending;
+                }
                 Poll::Ready(Ok(n)) => self.sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
@@ -471,7 +483,7 @@ impl SafeSlot for Write {
             // A frame is bounded as a line is: past the ceiling it is refused, never gathered.
             if c.message.len() + bytes.len() > MAX_LINE_BYTES {
                 c.message.clear();
-                return o.fail(Refusal::refused(FRAME_TOO_LONG));
+                return o.fail(Refusal::failed(FRAME_TOO_LONG));
             }
             c.message.extend_from_slice(bytes);
             if end {
