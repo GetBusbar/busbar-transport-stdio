@@ -8,7 +8,7 @@
 use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::mechanism::door::KindTailHead;
 use busbar_contract::abi::transport::{
-    TransportTail, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_CARRIER,
+    TransportTail, FACT_DIALS, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_CARRIER,
 };
 
 /// The claim this entry answers for: the stdio row's key.
@@ -31,7 +31,10 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_CARRIER,
     framing: FRAMING_STREAM,
-    facts: 0,
+    // Its ops (coordinator ruling L1): it dials only (`dial` spawns the program); nothing connects
+    // in to a program's pipes, so it never accepts. Pipes carry no protocol that hands a stream on,
+    // so detach and adopt are absent and held to their refusal.
+    facts: FACT_DIALS,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
     _reserved: 0,
