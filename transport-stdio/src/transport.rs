@@ -50,8 +50,9 @@ use busbar_contract::abi::transport::{
 /// whole. Past it the line is a framing fault, not a big frame, and the read fails.
 pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 
-/// The most bytes one connection holds queued for the program and not yet taken by its pipe: a
-/// `write` past it waits for the pipe to drain.
+/// The queued bytes past which a `write` takes nothing more and waits for the pipe to drain. It
+/// gates further writes; the queue itself holds at most this plus one line ([`MAX_LINE_BYTES`]),
+/// the frame that crossed it.
 pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
 
 /// How many bytes one pipe read takes.
@@ -82,6 +83,8 @@ fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
 
 /// Why a read fails.
 pub const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
+/// Why a write is refused when the frame it gathers passes the line ceiling.
+pub const FRAME_TOO_LONG: &str = "a frame ran past the stdio line ceiling";
 /// Why a write is refused.
 pub const NOT_ONE_LINE: &str =
     "a message holding a newline, or ending in a carriage return, is not one line";
@@ -169,17 +172,20 @@ impl Carried {
     }
 
     /// The member `key`'s program ended at `now`: counted once per connection.
+    /// An end met while the host's clock does not answer stays uncounted, so a later read or the
+    /// connection's shut counts it.
     fn ended(&self, c: &mut Conn, now: Option<u64>) {
         if c.key == 0 || c.counted {
             return;
         }
+        let Some(now) = now else {
+            return;
+        };
         c.counted = true;
-        if let Some(now) = now {
-            lock(&self.supervised)
-                .entry(c.key)
-                .or_default()
-                .crashed(now);
-        }
+        lock(&self.supervised)
+            .entry(c.key)
+            .or_default()
+            .crashed(now);
     }
 }
 
@@ -351,9 +357,13 @@ impl SafeSlot for Dial {
             let Some(at) = now(&inst) else {
                 return o.fail(Refusal::failed(NO_CLOCK));
             };
-            let held_down = lock(&c.supervised)
-                .get(&key)
-                .is_some_and(|s| !s.may_restart(at));
+            let held_down = {
+                let mut supervised = lock(&c.supervised);
+                // A key whose state holds nothing reads as a fresh one: dropped, so the map holds
+                // only members inside their window and members held down until declared anew.
+                supervised.retain(|_, s| !s.idle(at));
+                supervised.get(&key).is_some_and(|s| !s.may_restart(at))
+            };
             if held_down {
                 return o.fail(Refusal::refused(HELD_DOWN));
             }
@@ -457,6 +467,11 @@ impl SafeSlot for Write {
                     return Outcome::Pending;
                 }
                 _ => {}
+            }
+            // A frame is bounded as a line is: past the ceiling it is refused, never gathered.
+            if c.message.len() + bytes.len() > MAX_LINE_BYTES {
+                c.message.clear();
+                return o.fail(Refusal::refused(FRAME_TOO_LONG));
             }
             c.message.extend_from_slice(bytes);
             if end {
