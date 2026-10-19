@@ -25,4 +25,5 @@ pub(crate) const CLAIMS: &[Claim] = &[Claim {
     unit0_trigger: UNIT0_FIRST_LINE,
     status_at: 0,
     _reserved: 0,
+    ..Claim::ZERO
 }];

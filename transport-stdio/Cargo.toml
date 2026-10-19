@@ -8,6 +8,9 @@ rust-version = "1.97"
 description = "The stdio transport: the carrier of a spawned program's pipes, one frame per line, over the host's I/O."
 license = "Apache-2.0"
 
+[lints]
+workspace = true
+
 [lib]
 # rlib: the LINKED door (`linked::door`), which a busbar build names as a compiled-in row. The
 # dropped-in door is the sibling `busbar-transport-stdio-plugin` cdylib, which exports this same door

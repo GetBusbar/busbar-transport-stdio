@@ -40,6 +40,7 @@ fn s(t: &str) -> AbiStr {
     AbiStr {
         ptr: t.as_ptr(),
         len: t.len(),
+        ..AbiStr::ZERO
     }
 }
 
@@ -66,6 +67,7 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         (*ih).ticket = Ticket {
             slot: 1,
             generation: 1,
+            ..Ticket::ZERO
         };
         let oh = std::ptr::from_mut(o).cast::<OutHead>();
         (*oh).size = size_of::<O>() as u32;

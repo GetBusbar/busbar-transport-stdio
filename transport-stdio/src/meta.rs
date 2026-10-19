@@ -18,6 +18,7 @@ pub const KEY: &str = "stdio";
 pub(crate) const NONE: AbiStr = AbiStr {
     ptr: std::ptr::null(),
     len: 0,
+    ..AbiStr::ZERO
 };
 
 /// The transport kind's tail: the CARRIER of a program's pipes (its role stated, ARCHITECT ruling
@@ -26,6 +27,7 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     head: KindTailHead {
         size: std::mem::size_of::<TransportTail>() as u32,
         _reserved: 0,
+        ..KindTailHead::ZERO
     },
     role: ROLE_CARRIER,
     framing: FRAMING_STREAM,
@@ -49,4 +51,5 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     settings_len: 0,
     fault_rows: std::ptr::null(),
     fault_rows_len: 0,
+    ..TransportTail::ZERO
 };
