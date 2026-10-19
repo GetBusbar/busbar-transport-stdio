@@ -89,6 +89,8 @@ struct Script {
     next_handle: u64,
     /// Spawns answered.
     spawns: u32,
+    /// Whether `clock.now` fails.
+    clock_fails: bool,
 }
 
 static SCRIPT: Mutex<Script> = Mutex::new(Script {
@@ -97,6 +99,7 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     ended: true,
     next_handle: 1,
     spawns: 0,
+    clock_fails: false,
 });
 static ONE: Mutex<()> = Mutex::new(());
 
@@ -144,6 +147,9 @@ extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
 }
 
 extern "C" fn clock_now(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    if with(|sc| sc.clock_fails) {
+        return answer(out, Outcome::Failed, 0, 0);
+    }
     // SAFETY: the carrier's `in`, and the reading slot it names.
     unsafe {
         let i = input.cast::<ClockNowIn>().read();
@@ -193,6 +199,7 @@ impl Carrier {
             ended: true,
             next_handle: 1,
             spawns: 0,
+            clock_fails: false,
         };
         let tables = Box::new(HostTables {
             size: size_of::<HostTables>() as u32,
@@ -420,4 +427,27 @@ fn a_program_no_member_runs_is_not_supervised() {
         c.run_to_end(0, "a");
     }
     assert_eq!(c.dial(0, "a").0, Outcome::Ready);
+}
+
+/// An end met while the host's clock does not answer is not lost: it is counted once the clock
+/// answers (here, at the connection's shut). RED (Q128 transport-stdio NIT): the end was marked
+/// counted without being counted.
+#[test]
+fn an_end_met_without_a_clock_is_counted_once_the_clock_answers() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    let (r, conn) = c.dial(60, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = true;
+        sc.clock_fails = true;
+    });
+    let _ = c.read(conn);
+    with(|sc| sc.clock_fails = false);
+    c.shut(conn);
+    assert_eq!(
+        c.dial(60, "a").0,
+        Outcome::Refused,
+        "the end was counted at the shut"
+    );
 }

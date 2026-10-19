@@ -515,3 +515,25 @@ fn a_line_of_a_hundred_kib_is_one_frame() {
         "a 100 KiB line must be read as one frame"
     );
 }
+
+/// A FRAME IS BOUNDED LIKE A LINE: the bytes gathered for one outbound frame stop at the line
+/// ceiling ([`MAX_LINE_BYTES`]), as an inbound line does; past it the write is REFUSED, not
+/// gathered without bound. RED (Q128 transport-stdio NIT): the gathered frame had no ceiling.
+#[test]
+fn a_gathered_frame_past_the_line_ceiling_is_refused() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    let chunk = vec![b'x'; 1024 * 1024];
+    let mut answered = Outcome::Ready;
+    for _ in 0..=MAX_LINE_BYTES / chunk.len() {
+        answered = h.write(&chunk, false).0;
+        if answered != Outcome::Ready {
+            break;
+        }
+    }
+    assert_eq!(
+        answered,
+        Outcome::Refused,
+        "a frame past the ceiling is refused"
+    );
+}
