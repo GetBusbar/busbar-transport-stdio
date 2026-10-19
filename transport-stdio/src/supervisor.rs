@@ -55,6 +55,18 @@ impl Supervisor {
         self.restart_at = Some(now.saturating_add(backoff));
     }
 
+    /// Whether it holds nothing at `now`: no end inside the window, no backoff pending, not
+    /// tripped. An idle supervisor reads exactly as a fresh one, so its key's state may be dropped;
+    /// a tripped one holds its member down until the member is declared anew.
+    pub fn idle(&self, now: u64) -> bool {
+        !self.tripped
+            && self.restart_at.is_none_or(|at| now >= at)
+            && self
+                .crashes
+                .iter()
+                .all(|t| now.saturating_sub(*t) > CRASH_WINDOW_NS)
+    }
+
     /// Whether the program may be spawned at `now`.
     pub fn may_restart(&self, now: u64) -> bool {
         !self.tripped && self.restart_at.is_none_or(|at| now >= at)
