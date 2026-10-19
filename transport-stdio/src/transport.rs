@@ -20,6 +20,11 @@
 //!   next `write` or `flush`.
 //! * `flush` writes what is queued; `shut` closes the handle (the host kills the program) and
 //!   forgets the connection; `arrival` answers no far end and no port.
+//! * THE SUPERVISOR is this carrier's (THE DESIGN §2, l.388; [`crate::supervisor`]): a dial for a
+//!   member (`DialIn::supervision_key` not `0`) is REFUSED while that member's program is held
+//!   down, and every end of it — its output closed, a failed pipe, a failed spawn, or found ended
+//!   when it is shut — is counted on the host's one clock. A clean shut of a running program is no
+//!   end.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -27,7 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
+use crate::supervisor::Supervisor;
 use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
+use busbar_contract::abi::mechanism::ticket::CompletionHandle;
 use busbar_contract::abi::sdk::door::{AbiIn, AbiOut};
 use busbar_contract::abi::sdk::io::{Io, IoFailure};
 use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
@@ -43,15 +50,41 @@ use busbar_contract::abi::transport::{
 /// whole. Past it the line is a framing fault, not a big frame, and the read fails.
 pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 
-/// The most bytes one connection holds queued for the program and not yet taken by its pipe: a
-/// `write` past it waits for the pipe to drain.
+/// The queued bytes past which a `write` takes nothing more and waits for the pipe to drain. It
+/// gates further writes; the queue itself holds at most this plus one line ([`MAX_LINE_BYTES`]),
+/// the frame that crossed it.
 pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
 
 /// How many bytes one pipe read takes.
 const READ_CHUNK: usize = 16 * 1024;
 
+/// Why a member's dial is refused while its program is held down.
+pub const HELD_DOWN: &str =
+    "dial: the program keeps ending; its restarts are held down by the stdio supervisor";
+/// Why a member's dial fails with no host clock to supervise it by.
+pub const NO_CLOCK: &str = "dial: the host lent this carrier no clock to supervise a program by";
+
+/// Reads a program's output may take to find its end at a shut, at most: past it, it is running.
+const SHUT_PROBE_READS: usize = 64;
+
+/// Whether the program behind `handle` has ENDED: its remaining output read and discarded (the
+/// connection is being shut) until its end, an error, or PENDING (running).
+fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
+    let mut chunk = [0_u8; READ_CHUNK];
+    for _ in 0..SHUT_PROBE_READS {
+        match io.read(handle, &mut chunk) {
+            Poll::Pending => return false,
+            Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => return true,
+            Poll::Ready(Ok(_)) => {}
+        }
+    }
+    false
+}
+
 /// Why a read fails.
 pub const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
+/// Why a write is refused when the frame it gathers passes the line ceiling.
+pub const FRAME_TOO_LONG: &str = "a frame ran past the stdio line ceiling";
 /// Why a write is refused.
 pub const NOT_ONE_LINE: &str =
     "a message holding a newline, or ending in a carriage return, is not one line";
@@ -69,10 +102,12 @@ struct Line {
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
-/// What one instance carries: its connections, each by the token it minted.
+/// What one instance carries: its connections, each by the token it minted, and the supervision of
+/// every member it has run a program for, by the member's supervision key.
 pub struct Carried {
     conns: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     next: AtomicU64,
+    supervised: Mutex<HashMap<u64, Supervisor>>,
 }
 
 /// One program's connection: the host's handle, the line being cut on the way in, the frame being
@@ -81,6 +116,10 @@ pub struct Carried {
 #[derive(Default)]
 struct Conn {
     io: u64,
+    /// The member's supervision key (`0`: unsupervised).
+    key: u64,
+    /// Its program's end was counted.
+    counted: bool,
     /// Bytes the program wrote; those before `head` are answered.
     inbound: Vec<u8>,
     /// Where the bytes not yet answered begin in `inbound`.
@@ -114,6 +153,7 @@ impl Life for Carried {
         Ok(Self {
             conns: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
+            supervised: Mutex::new(HashMap::new()),
         })
     }
 
@@ -130,6 +170,35 @@ impl Carried {
     fn conn(&self, token: u64) -> Option<Arc<Mutex<Conn>>> {
         lock(&self.conns).get(&token).cloned()
     }
+
+    /// The member `key`'s program ended at `now`: counted once per connection.
+    /// An end met while the host's clock does not answer stays uncounted, so a later read or the
+    /// connection's shut counts it.
+    fn ended(&self, c: &mut Conn, now: Option<u64>) {
+        if c.key == 0 || c.counted {
+            return;
+        }
+        let Some(now) = now else {
+            return;
+        };
+        c.counted = true;
+        lock(&self.supervised)
+            .entry(c.key)
+            .or_default()
+            .crashed(now);
+    }
+}
+
+/// The host's monotonic clock now (THE DESIGN §1: one clock, lent to transports, l.291); `None`
+/// when the host lends no clock.
+fn now(i: &Instance<'_, State>) -> Option<u64> {
+    let services = i.get()?.host()?.services()?;
+    let handle = CompletionHandle {
+        ticket: i.ticket(),
+        seq: 0,
+        _reserved: 0,
+    };
+    services.clock_now(handle).ok().map(|r| r.mono_ns)
 }
 
 /// The open instance and the host's I/O for this op, or the refusal a call on none earns.
@@ -153,12 +222,12 @@ fn refusal(e: &IoFailure) -> Refusal {
 
 /// Run `body` over the instance, its I/O and the connection `conn`, failing the op without one.
 macro_rules! over {
-    ($inst:expr, $o:expr, $conn:expr, |$io:ident, $c:ident| $body:block) => {{
-        let (carried, mut $io) = match carried(&$inst) {
+    ($inst:expr, $o:expr, $conn:expr, |$carried:ident, $io:ident, $c:ident| $body:block) => {{
+        let ($carried, mut $io) = match carried(&$inst) {
             Ok(x) => x,
             Err(r) => return $o.fail(r),
         };
-        let Some(conn) = carried.conn($conn) else {
+        let Some(conn) = $carried.conn($conn) else {
             return $o.fail(Refusal::failed("no such connection"));
         };
         let mut $c = lock(&conn);
@@ -279,18 +348,46 @@ impl SafeSlot for Dial {
             Ok(x) => x,
             Err(r) => return o.fail(r),
         };
+        // THE SUPERVISOR: a member's program is spawned only when its policy lets it restart, on
+        // the host's clock; a member with no clock to be supervised by is not run unsupervised.
+        let key = i.supervision_key;
+        let at = if key == 0 {
+            None
+        } else {
+            let Some(at) = now(&inst) else {
+                return o.fail(Refusal::failed(NO_CLOCK));
+            };
+            let held_down = {
+                let mut supervised = lock(&c.supervised);
+                // A key whose state holds nothing reads as a fresh one: dropped, so the map holds
+                // only members inside their window and members held down until declared anew.
+                supervised.retain(|_, s| !s.idle(at));
+                supervised.get(&key).is_some_and(|s| !s.may_restart(at))
+            };
+            if held_down {
+                return o.fail(Refusal::refused(HELD_DOWN));
+            }
+            Some(at)
+        };
         match io.spawn_dest(dest) {
             Ok(h) => {
                 let token = c.next.fetch_add(1, Ordering::Relaxed);
                 let conn = Conn {
                     io: h,
+                    key,
                     ..Conn::default()
                 };
                 lock(&c.conns).insert(token, Arc::new(Mutex::new(conn)));
                 o.set(|o| &o.conn, token);
                 Outcome::Ready
             }
-            Err(e) => o.fail(refusal(&e)),
+            Err(e) => {
+                // A spawn that fails repeats on every attempt: it is counted like any end.
+                if let Some(at) = at {
+                    lock(&c.supervised).entry(key).or_default().crashed(at);
+                }
+                o.fail(refusal(&e))
+            }
         }
     }
 }
@@ -302,7 +399,7 @@ impl SafeSlot for Read {
     type Out = IoOut;
     type State = State;
     fn call(inst: Instance<'_, State>, i: Lent<'_, ReadIn>, mut o: Out<'_, IoOut>) -> Outcome {
-        over!(inst, o, i.conn, |io, c| {
+        over!(inst, o, i.conn, |carried, io, c| {
             let mut buf = i.buf();
             loop {
                 if let Some(mut line) = c.line {
@@ -334,9 +431,15 @@ impl SafeSlot for Read {
                 let mut chunk = [0_u8; READ_CHUNK];
                 match io.read(c.io, &mut chunk) {
                     Poll::Pending => return Outcome::Pending,
-                    Poll::Ready(Ok(0)) => c.ended = true,
+                    Poll::Ready(Ok(0)) => {
+                        c.ended = true;
+                        carried.ended(&mut c, now(&inst));
+                    }
                     Poll::Ready(Ok(n)) => c.inbound.extend_from_slice(&chunk[..n]),
-                    Poll::Ready(Err(e)) => return o.fail(refusal(&e)),
+                    Poll::Ready(Err(e)) => {
+                        carried.ended(&mut c, now(&inst));
+                        return o.fail(refusal(&e));
+                    }
                 }
             }
         })
@@ -353,14 +456,22 @@ impl SafeSlot for Write {
     fn call(inst: Instance<'_, State>, i: Lent<'_, WriteIn>, mut o: Out<'_, IoOut>) -> Outcome {
         let bytes = i.bytes();
         let end = i.flags & WRITE_END_OF_FRAME != 0;
-        over!(inst, o, i.conn, |io, c| {
+        over!(inst, o, i.conn, |carried, io, c| {
             // What the pipe has not taken goes first; past the cap, nothing more is taken.
             match c.drain(&mut io) {
-                Poll::Ready(Err(e)) => return o.fail(refusal(&e)),
+                Poll::Ready(Err(e)) => {
+                    carried.ended(&mut c, now(&inst));
+                    return o.fail(refusal(&e));
+                }
                 Poll::Pending if c.outbound.len() - c.sent >= MAX_QUEUED_BYTES => {
                     return Outcome::Pending;
                 }
                 _ => {}
+            }
+            // A frame is bounded as a line is: past the ceiling it is refused, never gathered.
+            if c.message.len() + bytes.len() > MAX_LINE_BYTES {
+                c.message.clear();
+                return o.fail(Refusal::refused(FRAME_TOO_LONG));
             }
             c.message.extend_from_slice(bytes);
             if end {
@@ -376,6 +487,7 @@ impl SafeSlot for Write {
                     return o.fail(Refusal::failed(NOT_ONE_LINE));
                 }
                 if let Poll::Ready(Err(e)) = c.drain(&mut io) {
+                    carried.ended(c, now(&inst));
                     return o.fail(refusal(&e));
                 }
             }
@@ -392,11 +504,14 @@ impl SafeSlot for Flush {
     type Out = OutHead;
     type State = State;
     fn call(inst: Instance<'_, State>, i: Lent<'_, ConnIn>, mut o: Out<'_, OutHead>) -> Outcome {
-        over!(inst, o, i.conn, |io, c| {
+        over!(inst, o, i.conn, |carried, io, c| {
             match c.drain(&mut io) {
                 Poll::Pending => Outcome::Pending,
                 Poll::Ready(Ok(())) => Outcome::Ready,
-                Poll::Ready(Err(e)) => o.fail(refusal(&e)),
+                Poll::Ready(Err(e)) => {
+                    carried.ended(&mut c, now(&inst));
+                    o.fail(refusal(&e))
+                }
             }
         })
     }
@@ -415,9 +530,25 @@ impl SafeSlot for Shut {
             Err(r) => return o.fail(r),
         };
         let gone = lock(&c.conns).remove(&i.conn);
-        if let Some(conn) = gone {
-            let h = lock(&conn).io;
-            let _ = io.close(h);
+        if let Some(held) = gone {
+            let mut conn = lock(&held);
+            // A member's program found ENDED at its shut (the host's lease found it exited) is an
+            // end: the host answers the program's own exit first (`io.ends`), so a descendant still
+            // holding its output does not hide it; a host that predates that answer leaves the
+            // pipe's end to tell. One still running (exit not answered, output PENDING) is a
+            // clean shut, no end.
+            if conn.key != 0
+                && !conn.counted
+                && !conn.ended
+                && (matches!(io.program_exit(conn.io), Ok(Some(_)))
+                    || found_ended(&mut io, conn.io))
+            {
+                conn.ended = true;
+            }
+            if conn.ended {
+                c.ended(&mut conn, now(&inst));
+            }
+            let _ = io.close(conn.io);
         }
         Outcome::Ready
     }
