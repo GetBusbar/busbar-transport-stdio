@@ -145,6 +145,11 @@ struct Script {
     written: Vec<u8>,
     /// Handles closed.
     closed: Vec<u64>,
+    /// The most bytes one `io.write` takes (`None` = all it is offered), the write after it
+    /// PENDING: a pipe under backpressure.
+    take: Option<usize>,
+    /// The next `io.write` pends (a pipe that took a part, then filled).
+    pend: bool,
 }
 
 static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
@@ -193,8 +198,21 @@ extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
     let i = unsafe { input.cast::<IoWriteIn>().read() };
     // SAFETY: the carrier's bytes.
     let bytes = unsafe { std::slice::from_raw_parts(i.bytes, i.len) };
-    with(|sc| sc.written.extend_from_slice(bytes));
-    answer(out, Outcome::Ready, 0, bytes.len() as u64)
+    let took = with(|sc| {
+        if sc.take.is_some() {
+            sc.pend = !sc.pend;
+            if !sc.pend {
+                return None;
+            }
+        }
+        let n = sc.take.map_or(bytes.len(), |t| t.min(bytes.len()));
+        sc.written.extend_from_slice(&bytes[..n]);
+        Some(n)
+    });
+    match took {
+        None => answer(out, Outcome::Pending, 0, 0),
+        Some(n) => answer(out, Outcome::Ready, 0, n as u64),
+    }
 }
 
 extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
@@ -533,7 +551,54 @@ fn a_gathered_frame_past_the_line_ceiling_is_refused() {
     }
     assert_eq!(
         answered,
-        Outcome::Refused,
-        "a frame past the ceiling is refused"
+        Outcome::Failed,
+        "a frame past the ceiling fails, as the contract's carrier script states for a frame the \
+         carrier refuses to carry (FAILED)"
     );
+}
+
+/// A LINE AT THE CEILING ENDING IN CRLF IS ONE FRAME however the pipe splits it: a read that
+/// delivers its CR before its LF holds the line one byte past the ceiling until the LF comes, and
+/// that is not too long. RED (Q128 transport-stdio LOW): it was refused when the CR came first.
+#[test]
+fn a_line_at_the_ceiling_ending_in_crlf_is_one_frame_however_it_is_split() {
+    let _one = ONE.lock().unwrap();
+    let mut line = vec![b'x'; MAX_LINE_BYTES];
+    line.push(b'\r');
+    let mut reads: Vec<Option<Vec<u8>>> =
+        line.chunks(16 * 1024).map(|c| Some(c.to_vec())).collect();
+    reads.push(Some(b"\n".to_vec()));
+    reads.push(None);
+    let h = Host::new(reads);
+    let (r, bytes, end, why) = h.read(MAX_LINE_BYTES + 1024);
+    assert_eq!(
+        (r, bytes.len(), end, why.as_str()),
+        (Outcome::Ready, MAX_LINE_BYTES, true, ""),
+        "the CR, delivered before its LF, does not make the line too long"
+    );
+}
+
+/// THE OUTBOUND QUEUE RECLAIMS WHAT THE PIPE TOOK as it takes it, not only on a full drain: under
+/// sustained backpressure (the pipe taking part of each write) its buffer reaches a steady size and
+/// allocates nothing more. RED (Q128 transport-stdio LOW): the written prefix was kept until the
+/// queue emptied, so the buffer grew with every frame.
+#[test]
+fn the_outbound_queue_reclaims_what_the_pipe_took() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    with(|sc| {
+        sc.take = Some(300);
+        sc.written.reserve(64 * 1024 * 1024);
+    });
+    let frame = vec![b'y'; 511];
+    // Warm the queue to its ceiling: each frame is more than the pipe takes per write.
+    for _ in 0..2_000 {
+        let _ = h.write_frame(&frame);
+    }
+    let (_, n) = allocations(|| {
+        for _ in 0..2_000 {
+            let _ = h.write_frame(&frame);
+        }
+    });
+    assert_eq!(n, 0, "the queue grew under backpressure: {n} allocations");
 }
