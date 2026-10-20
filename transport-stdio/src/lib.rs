@@ -7,8 +7,9 @@
 //! program (an absolute path, its arguments and its whole environment, no shell), owns its pipes and
 //! kills it when the connection closes. This crate holds only the host's opaque handle ([`door`])
 //! and owns the policy over it: the spawn it asks for, one frame per line on the way in, one line
-//! per frame on the way out, and the close. It spawns no thread and reads no clock. It knows no
-//! protocol, no plane and no principal.
+//! per frame on the way out, the close, and the supervision of a member's program that keeps ending
+//! ([`supervisor`], on the host's one clock). It spawns no thread. It knows no protocol, no plane
+//! and no principal.
 //!
 //! One door, two ways in: a build that links this crate names [`linked::door`]; the sibling
 //! `busbar-transport-stdio-plugin` cdylib exports the same door as its image's one symbol
@@ -23,6 +24,7 @@
 mod claims;
 pub mod door;
 mod meta;
+pub mod supervisor;
 mod transport;
 
 /// THE TRANSPORT AXIS ENTRY: what the composition root folds for this transport: its key, the
