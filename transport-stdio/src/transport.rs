@@ -24,7 +24,7 @@
 //!   forgets the connection; `arrival` answers no far end and no port.
 //! * THE SUPERVISOR is this carrier's (THE DESIGN §2, l.388; [`crate::supervisor`]): a dial for a
 //!   member (`DialIn::supervision_key` not `0`) is REFUSED while that member's program is held
-//!   down, and every end of it — its output closed, a failed pipe, a failed spawn, or found ended
+//!   down (a member's state is kept only while its program runs or a hold runs), and every end of it — its output closed, a failed pipe, a failed spawn, or found ended
 //!   when it is shut — is counted on the host's one clock. A clean shut of a running program is no
 //!   end.
 
@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
-use crate::supervisor::{Hold, Supervisor};
+use crate::supervisor::{Hold, Supervised};
 use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
 use busbar_contract::abi::mechanism::ticket::CompletionHandle;
 use busbar_contract::abi::sdk::door::{AbiIn, AbiOut};
@@ -82,7 +82,7 @@ pub fn held_down(hold: Hold) -> String {
         ),
         Hold::Tripped { ends } => format!(
             "dial: the program ended {} within a minute; the stdio supervisor holds its restarts \
-             down until the member is declared anew",
+             down while it keeps asking",
             ended(ends)
         ),
     }
@@ -135,7 +135,7 @@ struct Line {
 pub struct Carried {
     conns: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     next: AtomicU64,
-    supervised: Mutex<HashMap<u64, Supervisor>>,
+    supervised: Mutex<Supervised>,
 }
 
 /// One program's connection: the host's handle, the line being cut on the way in, the frame being
@@ -181,7 +181,7 @@ impl Life for Carried {
         Ok(Self {
             conns: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
-            supervised: Mutex::new(HashMap::new()),
+            supervised: Mutex::new(Supervised::default()),
         })
     }
 
@@ -210,10 +210,7 @@ impl Carried {
             return;
         };
         c.counted = true;
-        lock(&self.supervised)
-            .entry(c.key)
-            .or_default()
-            .crashed(now);
+        lock(&self.supervised).crashed(c.key, now);
     }
 }
 
@@ -382,13 +379,9 @@ impl SafeSlot for Dial {
             let Some(at) = now(&inst) else {
                 return o.fail(Refusal::failed(NO_CLOCK));
             };
-            let hold = {
-                let mut supervised = lock(&c.supervised);
-                // A key whose state holds nothing reads as a fresh one: dropped, so the map holds
-                // only members inside their window and members held down until declared anew.
-                supervised.retain(|_, s| !s.idle(at));
-                supervised.get(&key).and_then(|s| s.hold(at))
-            };
+            // A key whose state holds nothing reads as a fresh one: dropped, so the map holds only
+            // members with a program running or a hold running.
+            let hold = lock(&c.supervised).admit(key, at);
             if let Some(hold) = hold {
                 return o.fail(Refusal::refused(held_down(hold)));
             }
@@ -402,6 +395,9 @@ impl SafeSlot for Dial {
                     key,
                     ..Conn::default()
                 };
+                if key != 0 {
+                    lock(&c.supervised).spawned(key);
+                }
                 lock(&c.conns).insert(token, Arc::new(Mutex::new(conn)));
                 o.set(|o| &o.conn, token);
                 Outcome::Ready
@@ -409,7 +405,7 @@ impl SafeSlot for Dial {
             Err(e) => {
                 // A spawn that fails repeats on every attempt: it is counted like any end.
                 if let Some(at) = at {
-                    lock(&c.supervised).entry(key).or_default().crashed(at);
+                    lock(&c.supervised).crashed(key, at);
                 }
                 o.fail(refusal(&e))
             }
@@ -564,6 +560,9 @@ impl SafeSlot for Shut {
             }
             if conn.ended {
                 c.ended(&mut conn, now(&inst));
+            }
+            if conn.key != 0 {
+                lock(&c.supervised).closed(conn.key);
             }
             let _ = io.close(conn.io);
         }

@@ -6,7 +6,7 @@
 //! read that answers the program's end or PENDING while it runs) and its one clock (`clock.now`,
 //! monotonic, set by the test). The figures are `predev`'s (the pre-fold stdio MCP client's restart
 //! policy; 1.5.5 spawned no program): a program that ends is held down under a backoff doubling
-//! from 100 ms, and five ends inside a minute stop its restarts until its member is declared anew.
+//! from 100 ms, and five ends inside a minute stop its restarts while its member keeps asking.
 //! A dial the policy holds down is REFUSED, saying how many ends it counted and how long it holds.
 //!
 //! The policy is kept per SUPERVISION KEY (`DialIn::supervision_key`), the member identity the host
@@ -317,7 +317,7 @@ fn advance(ns: u64) {
 // ── the tests ────────────────────────────────────────────────────────────────────────────────────
 
 /// A program that ends is held down for 100 ms, doubling; the fifth end inside a minute stops its
-/// restarts for good (an hour later it is still refused).
+/// restarts while its member keeps asking (dialled every 30 s for an hour, it is still refused).
 #[test]
 fn a_program_that_keeps_ending_is_held_down_then_stopped() {
     let _one = ONE.lock().unwrap();
@@ -342,12 +342,14 @@ fn a_program_that_keeps_ending_is_held_down_then_stopped() {
     c.run_to_end(1, "a");
     advance(800 * MS);
     c.run_to_end(1, "a");
-    advance(3_600_000 * MS);
-    assert_eq!(
-        c.dial(1, "a").0,
-        Outcome::Refused,
-        "five ends in a minute: stopped"
-    );
+    for _ in 0..120 {
+        advance(30_000 * MS);
+        assert_eq!(
+            c.dial(1, "a").0,
+            Outcome::Refused,
+            "five ends in a minute: stopped while it keeps asking"
+        );
+    }
 }
 
 /// A spawn that fails is counted like any end.
@@ -497,6 +499,6 @@ fn the_held_down_refusal_counts_the_ends_and_names_the_hold() {
     assert_eq!(
         why,
         "dial: the program ended 5 times within a minute; the stdio supervisor holds its \
-         restarts down until the member is declared anew"
+         restarts down while it keeps asking"
     );
 }
