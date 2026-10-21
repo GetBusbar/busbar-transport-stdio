@@ -3,8 +3,8 @@
 
 use super::*;
 
-/// 1.5.5's crash-loop policy, figure for figure: a backoff doubling from 100 ms, and the fifth end
-/// inside a minute stopping the restarts for good.
+/// The crash-loop policy of predev's connector, figure for figure: a backoff doubling from 100 ms,
+/// and the fifth end inside a minute stopping the restarts for good.
 #[test]
 fn the_backoff_doubles_and_the_fifth_end_in_a_minute_trips() {
     let mut s = Supervisor::default();

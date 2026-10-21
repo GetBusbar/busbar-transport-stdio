@@ -565,3 +565,7 @@ impl SafeSlot for Arrival {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/transport_tests.rs"]
+mod tests;
