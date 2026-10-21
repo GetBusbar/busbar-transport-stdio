@@ -615,8 +615,9 @@ fn a_gathered_frame_past_the_line_ceiling_fails() {
 /// default is the default ceiling. RED (row 159, stdio MEDIUM M2): the carrier read no setting.
 #[test]
 fn the_tail_declares_the_request_body_bound_it_reads() {
-    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
-    let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
+    // SAFETY: `door` answers the `'static` door of this crate, whose Statement's kind tail is its
+    // `'static` `TransportTail`.
+    let tail = unsafe { &*(*(*door()).statement).kind_tail.cast::<TransportTail>() };
     assert_eq!(tail.settings_len, 1, "one setting declared");
     // SAFETY: the tail's own `'static` list, `settings_len` long.
     let decl = unsafe { &*tail.settings };
