@@ -36,5 +36,5 @@ pub mod linked {
     pub const COMPOSES_OVER: &[&str] = &[];
     /// Whether this transport carries sessions.
     pub const SESSION: bool = true;
-    pub use crate::door::door;
+    pub use crate::door::{door, MACRO_DOOR};
 }
