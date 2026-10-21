@@ -7,7 +7,8 @@
 //! monotonic, set by the test). The figures are `predev`'s (the pre-fold stdio MCP client's restart
 //! policy; 1.5.5 spawned no program): a program that ends is held down under a backoff doubling
 //! from 100 ms, and five ends inside a minute stop its restarts, never on a timeout, until the
-//! operator applies the configuration again (the instance's `refresh`).
+//! member's supervision key changes (`predev`'s stdio client, busbar `732ba319c0`,
+//! stdio.rs:1013-1027, reset a child only when its own `command:` changed).
 //! A dial the policy holds down is REFUSED, saying how many ends it counted and how long it holds.
 //!
 //! The policy is kept per SUPERVISION KEY (`DialIn::supervision_key`), the member identity the host
@@ -286,7 +287,7 @@ impl Carrier {
         call(ops().read, self.inst, &mut i, &mut o, slot::READ)
     }
 
-    /// The operator applies the configuration again: the instance's `refresh`.
+    /// A config apply: the instance's `refresh`.
     fn refresh(&self) {
         let mut i: RefreshIn = z();
         i.generation = 2;
@@ -375,19 +376,44 @@ fn a_program_that_keeps_ending_is_held_down_then_stopped() {
     );
 }
 
-/// THE OPERATOR'S CONFIG APPLY CLEARS A TRIP (`predev` cleared one only by an operator's
-/// re-approval): after the instance's `refresh` the tripped member's next dial spawns its program.
-/// RED: a refresh cleared nothing.
+/// AN UNRELATED CONFIG APPLY KEEPS A TRIPPED MEMBER TRIPPED (`predev`'s stdio client, busbar
+/// `732ba319c0`, stdio.rs:1013-1027, reset a child only when its own `command:` changed, "so
+/// touching an unrelated key does not re-arm a fork bomb"): after the instance's `refresh` the
+/// member's key is unchanged and its next dial is still refused, no program spawned. RED: a
+/// refresh cleared every trip, so each config apply re-armed every crash-looping program.
 #[test]
-fn a_refresh_clears_a_trip_and_the_next_dial_spawns() {
+fn an_unrelated_config_apply_keeps_a_tripped_member_tripped() {
     let _one = ONE.lock().unwrap();
     let c = Carrier::open();
     c.trip(80, "a");
     assert_eq!(c.dial(80, "a").0, Outcome::Refused, "tripped");
-    c.refresh();
     let spawns = with(|sc| sc.spawns);
-    let (r, conn) = c.dial(80, "a");
-    assert_eq!(r, Outcome::Ready, "the trip is cleared");
+    c.refresh();
+    c.refresh();
+    assert_eq!(
+        c.dial(80, "a").0,
+        Outcome::Refused,
+        "the config apply left its command alone: still tripped"
+    );
+    assert_eq!(with(|sc| sc.spawns), spawns, "no program is spawned");
+}
+
+/// GREEN TWIN: a changed `command:` resets the member. The host mints a new supervision key for
+/// the changed program, so its next dial spawns, while the old key's trip stands.
+#[test]
+fn a_changed_command_resets_the_member() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    c.trip(82, "a");
+    c.refresh();
+    assert_eq!(
+        c.dial(82, "a").0,
+        Outcome::Refused,
+        "tripped, and applied over"
+    );
+    let spawns = with(|sc| sc.spawns);
+    let (r, conn) = c.dial(83, "a");
+    assert_eq!(r, Outcome::Ready, "the changed command is a new key: fresh");
     assert_eq!(with(|sc| sc.spawns), spawns + 1, "the program is spawned");
     with(|sc| sc.ended = false);
     c.shut(conn);
@@ -539,7 +565,7 @@ fn the_held_down_refusal_counts_the_ends_and_names_the_hold() {
     assert_eq!(r, Outcome::Refused);
     assert_eq!(
         why,
-        "dial: the program ended 5 times within a minute; the stdio supervisor stopped its \
-         restarts until the configuration is applied again"
+        "dial: the stdio supervisor tripped when the program ended 5 times within a minute; it \
+         stays stopped until the member's command changes"
     );
 }

@@ -8,15 +8,17 @@
 //! minute tripping its breaker). A circuit breaker, not a retry loop: each end is
 //! timed on the host's one clock (monotonic, `clock.now`, THE DESIGN §1 and l.291); the next spawn
 //! waits a backoff doubling from [`BASE_BACKOFF_NS`] to [`MAX_BACKOFF_NS`], and [`CRASH_THRESHOLD`]
-//! ends inside [`CRASH_WINDOW_NS`] TRIP it: the restarts stop until the operator applies the
-//! configuration again (the instance's `refresh`), never on a timeout, whether or not the member
-//! keeps asking. `predev` cleared a trip only by an operator's explicit re-approval; the 1.6.0
-//! operator's act is the config apply, which clears every trip ([`Supervised::refresh`]).
+//! ends inside [`CRASH_WINDOW_NS`] TRIP it: the restarts stop, never on a timeout, whether or not
+//! the member keeps asking. A trip lasts until that member's supervision key changes. `predev`'s
+//! stdio client (busbar `732ba319c0`, stdio.rs:1013-1027) reset a child only when its own
+//! `command:` changed, \"so touching an unrelated key does not re-arm a fork bomb\"; a config apply
+//! that leaves the member's program alone therefore clears nothing here either.
 //!
 //! One supervisor per SUPERVISION KEY (`DialIn::supervision_key`): the host mints a key for each
 //! member and keeps it while the member's program is unchanged across re-declarations, so the
-//! supervision resets exactly when the member is new — never for a sibling member running the same
-//! program, never for a changed secret value under an unchanged member.
+//! supervision resets exactly when the member's program changes or the member is new — never for a
+//! sibling member running the same program, never for a changed secret value under an unchanged
+//! member, never for a config apply that touches an unrelated key.
 
 use std::collections::HashMap;
 
@@ -42,10 +44,9 @@ pub enum Hold {
         /// How long until the backoff passes.
         remaining_ns: u64,
     },
-    /// `ends` ends inside the window tripped it: no restart until the configuration is applied
-    /// again.
+    /// `ends` ends inside the window tripped it: no restart while the member's key stands.
     Tripped {
-        /// The ends counted inside the window when it tripped.
+        /// The ends counted inside the window at the instant it tripped.
         ends: usize,
     },
 }
@@ -59,8 +60,7 @@ pub struct Supervisor {
     crashes: Vec<u64>,
     /// No spawn before this instant.
     restart_at: Option<u64>,
-    /// [`CRASH_THRESHOLD`] ends inside the window: no restart until the configuration is applied
-    /// again.
+    /// [`CRASH_THRESHOLD`] ends inside the window: no restart while this key stands.
     tripped: bool,
 }
 
@@ -85,7 +85,7 @@ impl Supervisor {
 
     /// Whether it holds nothing at `now`, so its key's state may be dropped: no program of its
     /// member running, no backoff pending, no end inside the window, and not tripped. A trip is
-    /// kept until the next refresh, never dropped on a timeout.
+    /// kept for as long as its key stands, never dropped on a timeout.
     pub fn idle(&self, now: u64) -> bool {
         self.live == 0
             && !self.tripped
@@ -115,10 +115,9 @@ impl Supervisor {
     }
 }
 
-/// EVERY MEMBER'S SUPERVISION, by its supervision key. Between refreshes an entry is kept while
-/// its member has a program running, a hold running or a trip ([`Supervisor::idle`]); a refresh
-/// (the operator's config apply) clears every trip and rebuilds the map from the programs running,
-/// so the keys of members declared anew never outlive the apply that retired them.
+/// EVERY MEMBER'S SUPERVISION, by its supervision key. An entry is kept while its member has a
+/// program running, a hold running or a trip ([`Supervisor::idle`]); only idle entries are swept.
+/// A config apply never touches the map: a trip lasts until the member's key changes.
 #[derive(Debug, Default)]
 pub struct Supervised {
     by_key: HashMap<u64, Supervisor>,
@@ -134,26 +133,6 @@ impl Supervised {
     pub fn admit(&mut self, key: u64, now: u64) -> Option<Hold> {
         self.sweep(now);
         self.by_key.get(&key).and_then(|s| s.hold(now))
-    }
-
-    /// THE OPERATOR'S RE-APPROVAL: the configuration was applied again (the instance's
-    /// `refresh`). Every trip, backoff and counted end is cleared; only the programs running now
-    /// are kept, each under a fresh supervisor.
-    pub fn refresh(&mut self) {
-        self.by_key = self
-            .by_key
-            .drain()
-            .filter(|(_, s)| s.live > 0)
-            .map(|(key, s)| {
-                (
-                    key,
-                    Supervisor {
-                        live: s.live,
-                        ..Supervisor::default()
-                    },
-                )
-            })
-            .collect();
     }
 
     /// The member `key`'s program was spawned: it runs until its connection is shut.

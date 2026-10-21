@@ -97,38 +97,38 @@ fn trip(m: &mut Supervised, key: u64, mut now: u64) -> u64 {
     now
 }
 
-/// A TRIP NEVER TIMES OUT; THE OPERATOR'S CONFIG APPLY CLEARS IT (`predev` cleared a trip only by
-/// an operator's re-approval, never on a timeout). Between refreshes a tripped key is kept and
-/// refused after an hour of silence; a refresh clears the trip and rebuilds the map from the
-/// programs running, so the keys of members declared anew are gone after it. RED: a refresh
-/// cleared nothing, and a tripped key was kept for the instance's life, one more for every
-/// re-declaration.
+/// A TRIP NEVER TIMES OUT AND LASTS UNTIL ITS KEY CHANGES (`predev`'s stdio client, busbar
+/// `732ba319c0`, stdio.rs:1013-1027, reset a child only when its own `command:` changed). A
+/// tripped key is kept and refused after an hour of silence and a sweep, while an idle entry is
+/// swept; a member's changed program is a new key and is admitted. RED: a trip was cleared by
+/// the config apply, or dropped on a timeout.
 #[test]
-fn a_refresh_clears_every_trip_and_keeps_only_the_programs_running() {
+fn a_trip_lasts_until_its_key_changes_and_only_idle_entries_are_swept() {
     let mut m = Supervised::default();
     let mut now = 1_000 * MS;
     // A member whose program runs.
     assert_eq!(m.admit(1, now), None);
     m.spawned(1);
-    // Ten re-declarations of a crash-looping member, each under a fresh key, each tripped.
+    // A member whose program ended once and is idle after its window.
+    m.spawned(2);
+    m.crashed(2, now);
+    m.closed(2);
+    // Ten tripped members.
     for key in 100..110 {
         now = trip(&mut m, key, now);
         assert!(matches!(m.admit(key, now), Some(Hold::Tripped { .. })));
     }
-    // An hour of silence: every trip still holds, and is kept.
+    // An hour of silence: every trip still holds, and is kept; the idle entry is swept.
     now += 3_600_000 * MS;
     m.sweep(now);
     assert_eq!(m.keys(), 11, "the live member and every trip");
     assert!(matches!(m.admit(100, now), Some(Hold::Tripped { .. })));
-    // The operator applies the configuration again.
-    m.refresh();
-    assert_eq!(m.keys(), 1, "only the program running is kept");
-    assert_eq!(m.admit(100, now), None, "the trip is cleared");
-    assert_eq!(m.admit(1, now), None);
-    // Its program shut, and nothing held, the live member's entry goes too.
+    // The member's command changed: a new key, admitted.
+    assert_eq!(m.admit(200, now), None, "a changed program is a new key");
+    // Its program shut, and nothing held, the live member's entry goes; the trips stay.
     m.closed(1);
     m.sweep(now);
-    assert_eq!(m.keys(), 0);
+    assert_eq!(m.keys(), 10);
 }
 
 /// The hold names what holds the program down: the ends counted inside the window and the backoff
