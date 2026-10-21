@@ -8,9 +8,12 @@ use super::*;
 /// message. RED (row 159, stdio LOW): `clear` kept the capacity for the life of the program.
 #[test]
 fn an_answered_line_gives_back_what_it_grew_the_buffer_to() {
-    let mut c = Conn::default();
-    c.inbound = vec![b'x'; 4 * 1024 * 1024];
-    c.inbound.push(b'\n');
+    let mut inbound = vec![b'x'; 4 * 1024 * 1024];
+    inbound.push(b'\n');
+    let mut c = Conn {
+        inbound,
+        ..Conn::default()
+    };
     let next = c.inbound.len();
     c.answered(next);
     assert!(c.inbound.is_empty());
