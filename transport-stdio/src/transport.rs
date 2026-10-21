@@ -12,23 +12,29 @@
 //! * `read` answers ONE FRAME PER LINE: the bytes up to each `0x0A`, the newline (and one carriage
 //!   return before it) stripped; the read that completes a line carries `READ_END_OF_FRAME`, and a
 //!   line longer than the host's buffer comes in several reads. A blank line is an empty frame. A
-//!   line past [`MAX_LINE_BYTES`] fails the read. At the program's end a final unterminated line
-//!   is a frame, then the clean end (`len` `0`, no frame bit).
+//!   line past the LINE CEILING fails the read. At the program's end a final unterminated line is
+//!   a frame, then the clean end (`len` `0`, no frame bit).
 //! * `write` gathers a frame's bytes until `WRITE_END_OF_FRAME`, then queues them as ONE line, the
-//!   `0x0A` appended. A frame holding a newline, or ending in a carriage return, cannot be one line
-//!   and is refused before a byte of it is written. What the pipe has not taken is written by the
-//!   next `write` or `flush`.
+//!   `0x0A` appended. A frame past the line ceiling, holding a newline, or ending in a carriage
+//!   return cannot be one line: each FAILS before a byte of it is written, the one class the
+//!   contract's carrier script states for a frame the carrier will not carry. What the pipe has not
+//!   taken is written by the next `write` or `flush`.
+//! * THE LINE CEILING is the deployment's request-body bound, the one setting this carrier reads
+//!   ([`BODY_MAX_BYTES`], at its 1.5.5 path; [`MAX_LINE_BYTES`] when the host hands none), taken at
+//!   `open` and moved by each `refresh`: the host holds one inbound message of a byte channel to
+//!   that bound, so a message the gateway takes through its front door crosses a stdio pipe whole,
+//!   either way.
 //! * `flush` writes what is queued; `shut` closes the handle (the host kills the program) and
 //!   forgets the connection; `arrival` answers no far end and no port.
 //! * THE SUPERVISOR is this carrier's (THE DESIGN §2, l.388; [`crate::supervisor`]): a dial for a
 //!   member (`DialIn::supervision_key` not `0`) is REFUSED while that member's program is held
-//!   down, and every end of it — its output closed, a failed pipe, a failed spawn, or found ended
-//!   when it is shut — is counted on the host's one clock. A clean shut of a running program is no
-//!   end.
+//!   down, and every end of it — its output closed, a failed pipe, a line past the ceiling, a failed
+//!   spawn, or found ended when it is shut — is counted on the host's one clock. A clean shut of a
+//!   running program is no end.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
@@ -37,26 +43,56 @@ use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
 use busbar_contract::abi::mechanism::ticket::CompletionHandle;
 use busbar_contract::abi::sdk::door::{AbiIn, AbiOut};
 use busbar_contract::abi::sdk::io::{Io, IoFailure};
-use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
+use busbar_contract::abi::sdk::life::{settings_object, Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::{Instance, Lent, Out, SafeSlot};
 use busbar_contract::abi::transport::{
     ArrivalIn, ArrivalOut, ConnIn, ConnOut, DialIn, IoOut, ReadIn, ShutIn, WriteIn,
     CANCEL_NOTHING_MOVED, DEST_PROGRAM, READ_END_OF_FRAME, WRITE_END_OF_FRAME,
 };
+use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
 
-/// The longest line this carrier frames, before its terminator (a line is one frame on this
-/// wire): the bound the host holds one inbound frame of a byte channel to, its request-body bound
-/// (32 MiB), so a message the gateway would take through its front door crosses a stdio pipe
-/// whole. Past it the line is a framing fault, not a big frame, and the read fails.
-pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+/// The setting this carrier reads, at its 1.5.5 path: the deployment's request-body bound, which
+/// is its LINE CEILING, the longest line it frames before its terminator (a line is one frame on
+/// this wire). Past it the line is a framing fault, not a big frame.
+pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
+
+/// The line ceiling when the host hands no [`BODY_MAX_BYTES`]: the host's own default request-body
+/// bound (32 MiB), the default the tail declares for the setting.
+pub const MAX_LINE_BYTES: usize = DEFAULT_REQUEST_BODY_MAX_BYTES;
 
 /// The queued bytes past which a `write` takes nothing more and waits for the pipe to drain. It
-/// gates further writes; the queue itself holds at most this plus one line ([`MAX_LINE_BYTES`]),
-/// the frame that crossed it.
+/// gates further writes; the queue itself holds at most this plus one line (at most the line
+/// ceiling), the frame that crossed it.
 pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
+
+/// The capacity a connection's buffer keeps once it is empty: what one large message grew it past
+/// this is given back, so a long-lived connection holds a working size, not its high-water mark.
+/// A buffer within it is kept whole, so the data path allocates nothing once warm.
+const KEEP_BYTES: usize = 256 * 1024;
 
 /// How many bytes one pipe read takes.
 const READ_CHUNK: usize = 16 * 1024;
+
+/// Why `validate`, `open` or `refresh` fails when the request-body bound is no count of bytes.
+pub const NOT_A_COUNT: &str = "settings: limits.request_body_max_bytes must be a count of bytes";
+
+/// The line ceiling `settings` states: its [`BODY_MAX_BYTES`], or [`MAX_LINE_BYTES`] when it states
+/// none.
+fn ceiling(settings: &[u8]) -> Result<usize, Refusal> {
+    match settings_object(settings)?.get(BODY_MAX_BYTES) {
+        None => Ok(MAX_LINE_BYTES),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| Refusal::failed(NOT_A_COUNT)),
+    }
+}
+
+/// `buf` emptied, giving back what it grew past [`KEEP_BYTES`].
+fn emptied(buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.shrink_to(KEEP_BYTES);
+}
 
 /// Why a member's dial is refused while its program is held down.
 pub const HELD_DOWN: &str =
@@ -64,8 +100,14 @@ pub const HELD_DOWN: &str =
 /// Why a member's dial fails with no host clock to supervise it by.
 pub const NO_CLOCK: &str = "dial: the host lent this carrier no clock to supervise a program by";
 
-/// Reads a program's output may take to find its end at a shut, at most: past it, it is running.
-const SHUT_PROBE_READS: usize = 64;
+/// The most output a program that exited can have left unread: one full pipe. The host reads the
+/// program's pipe itself and holds none of it, and a pipe is 64 KiB unless the program resizes its
+/// own, at most to 1 MiB (Linux `fs.pipe-max-size`, its default).
+const PIPE_MAX_BYTES: usize = 1024 * 1024;
+
+/// Reads a program's output may take to find its end at a shut, at most: a full pipe, then the read
+/// that finds its end. Past it, the program is still writing: it is running.
+const SHUT_PROBE_READS: usize = PIPE_MAX_BYTES / READ_CHUNK + 1;
 
 /// Whether the program behind `handle` has ENDED: its remaining output read and discarded (the
 /// connection is being shut) until its end, an error, or PENDING (running).
@@ -83,9 +125,9 @@ fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
 
 /// Why a read fails.
 pub const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
-/// Why a write is refused when the frame it gathers passes the line ceiling.
+/// Why a write fails when the frame it gathers passes the line ceiling.
 pub const FRAME_TOO_LONG: &str = "a frame ran past the stdio line ceiling";
-/// Why a write is refused.
+/// Why a write fails when its frame cannot be one line.
 pub const NOT_ONE_LINE: &str =
     "a message holding a newline, or ending in a carriage return, is not one line";
 
@@ -102,12 +144,15 @@ struct Line {
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
-/// What one instance carries: its connections, each by the token it minted, and the supervision of
-/// every member it has run a program for, by the member's supervision key.
+/// What one instance carries: its connections, each by the token it minted, the supervision of
+/// every member it has run a program for, by the member's supervision key, and its line ceiling.
 pub struct Carried {
     conns: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     next: AtomicU64,
     supervised: Mutex<HashMap<u64, Supervisor>>,
+    /// The line ceiling: the deployment's request-body bound, as `open` or the last `refresh` was
+    /// handed it.
+    ceiling: AtomicUsize,
 }
 
 /// One program's connection: the host's handle, the line being cut on the way in, the frame being
@@ -120,6 +165,9 @@ struct Conn {
     key: u64,
     /// Its program's end was counted.
     counted: bool,
+    /// An op on it failed on its program's side (a failed pipe, a line past the ceiling): its
+    /// generation ends, an end like its output closing.
+    faulted: bool,
     /// Bytes the program wrote; those before `head` are answered.
     inbound: Vec<u8>,
     /// Where the bytes not yet answered begin in `inbound`.
@@ -144,20 +192,23 @@ impl Life for Carried {
     /// A PENDING carrier op moved nothing, so a cancel finds nothing moved.
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
-    /// This carrier reads no setting.
-    fn validate(_: &[u8]) -> Result<(), Refusal> {
-        Ok(())
+    /// The one setting it reads, [`BODY_MAX_BYTES`], is a count of bytes.
+    fn validate(settings: &[u8]) -> Result<(), Refusal> {
+        ceiling(settings).map(|_| ())
     }
 
-    fn open(_: &[u8], _: &[&[u8]], _: u64) -> Result<Self, Refusal> {
+    fn open(settings: &[u8], _: &[&[u8]], _: u64) -> Result<Self, Refusal> {
         Ok(Self {
             conns: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             supervised: Mutex::new(HashMap::new()),
+            ceiling: AtomicUsize::new(ceiling(settings)?),
         })
     }
 
-    fn refresh(&self, _: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
+    /// A config apply moves the line ceiling; it holds from each connection's next op.
+    fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
+        self.ceiling.store(ceiling(settings)?, Ordering::Relaxed);
         Ok(Refreshed::default())
     }
 }
@@ -186,6 +237,19 @@ impl Carried {
             .entry(c.key)
             .or_default()
             .crashed(now);
+    }
+
+    /// An op on the member's connection failed on its program's side (a failed pipe, a line past
+    /// the ceiling): the host ends the generation, so it is an end, counted now or, met while the
+    /// clock does not answer, at the connection's shut.
+    fn faulted(&self, c: &mut Conn, now: Option<u64>) {
+        c.faulted = true;
+        self.ended(c, now);
+    }
+
+    /// The line ceiling now.
+    fn ceiling(&self) -> usize {
+        self.ceiling.load(Ordering::Relaxed)
     }
 }
 
@@ -238,8 +302,8 @@ macro_rules! over {
 impl Conn {
     /// The next whole line in `inbound` (the newline and a carriage return before it stripped);
     /// at the program's end, the unterminated rest. Scans only the bytes no earlier scan saw.
-    /// `Err` for a line past [`MAX_LINE_BYTES`].
-    fn next_line(&mut self) -> Result<Option<Line>, &'static str> {
+    /// `Err` for a line past the ceiling `max`.
+    fn next_line(&mut self, max: usize) -> Result<Option<Line>, &'static str> {
         let from = self.scanned.max(self.head);
         match self.inbound[from..].iter().position(|&b| b == b'\n') {
             Some(rel) => {
@@ -248,7 +312,7 @@ impl Conn {
                 if end > self.head && self.inbound[end - 1] == b'\r' {
                     end -= 1;
                 }
-                if end - self.head > MAX_LINE_BYTES {
+                if end - self.head > max {
                     return Err(TOO_LONG);
                 }
                 self.scanned = newline + 1;
@@ -261,7 +325,11 @@ impl Conn {
             None => {
                 self.scanned = self.inbound.len();
                 let rest = self.inbound.len() - self.head;
-                if rest > MAX_LINE_BYTES {
+                // A carriage return at the end of a running program's output may be the CR of a
+                // CRLF whose LF has not arrived: it is the terminator's, not the line's.
+                let cr =
+                    usize::from(!self.ended && rest > 0 && self.inbound.last() == Some(&b'\r'));
+                if rest - cr > max {
                     Err(TOO_LONG)
                 } else if self.ended && rest > 0 {
                     Ok(Some(Line {
@@ -277,12 +345,13 @@ impl Conn {
     }
 
     /// The line answered: the bytes after it are next. Answered bytes are dropped once nothing is
-    /// left after them, and moved out of the way before the next pipe read, keeping the buffer.
+    /// left after them (the buffer giving back what a large line grew it past [`KEEP_BYTES`]), and
+    /// moved out of the way before the next pipe read, keeping the buffer.
     fn answered(&mut self, next: usize) {
         self.line = None;
         self.head = next;
         if self.head == self.inbound.len() {
-            self.inbound.clear();
+            emptied(&mut self.inbound);
             self.head = 0;
             self.scanned = 0;
         }
@@ -306,7 +375,7 @@ impl Conn {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
         }
-        self.outbound.clear();
+        emptied(&mut self.outbound);
         self.sent = 0;
         Poll::Ready(Ok(()))
     }
@@ -401,6 +470,7 @@ impl SafeSlot for Read {
     fn call(inst: Instance<'_, State>, i: Lent<'_, ReadIn>, mut o: Out<'_, IoOut>) -> Outcome {
         over!(inst, o, i.conn, |carried, io, c| {
             let mut buf = i.buf();
+            let max = carried.ceiling();
             loop {
                 if let Some(mut line) = c.line {
                     let n = buf.stream(&c.inbound[line.at..line.end]);
@@ -415,7 +485,7 @@ impl SafeSlot for Read {
                     o.set(|o| &o.flags, if done { READ_END_OF_FRAME } else { 0 });
                     return Outcome::Ready;
                 }
-                match c.next_line() {
+                match c.next_line(max) {
                     Ok(Some(line)) => {
                         c.line = Some(line);
                         continue;
@@ -425,7 +495,12 @@ impl SafeSlot for Read {
                         return Outcome::Ready;
                     }
                     Ok(None) => {}
-                    Err(why) => return o.fail(Refusal::failed(why)),
+                    Err(why) => {
+                        // The program's line ran past the ceiling: the host ends the generation
+                        // and shuts the program still running, so the end is counted here.
+                        carried.faulted(&mut c, now(&inst));
+                        return o.fail(Refusal::failed(why));
+                    }
                 }
                 c.compact();
                 let mut chunk = [0_u8; READ_CHUNK];
@@ -437,7 +512,7 @@ impl SafeSlot for Read {
                     }
                     Poll::Ready(Ok(n)) => c.inbound.extend_from_slice(&chunk[..n]),
                     Poll::Ready(Err(e)) => {
-                        carried.ended(&mut c, now(&inst));
+                        carried.faulted(&mut c, now(&inst));
                         return o.fail(refusal(&e));
                     }
                 }
@@ -460,7 +535,7 @@ impl SafeSlot for Write {
             // What the pipe has not taken goes first; past the cap, nothing more is taken.
             match c.drain(&mut io) {
                 Poll::Ready(Err(e)) => {
-                    carried.ended(&mut c, now(&inst));
+                    carried.faulted(&mut c, now(&inst));
                     return o.fail(refusal(&e));
                 }
                 Poll::Pending if c.outbound.len() - c.sent >= MAX_QUEUED_BYTES => {
@@ -468,26 +543,27 @@ impl SafeSlot for Write {
                 }
                 _ => {}
             }
-            // A frame is bounded as a line is: past the ceiling it is refused, never gathered.
-            if c.message.len() + bytes.len() > MAX_LINE_BYTES {
-                c.message.clear();
-                return o.fail(Refusal::refused(FRAME_TOO_LONG));
+            // A frame is bounded as a line is: past the ceiling it fails, never gathered.
+            if c.message.len() + bytes.len() > carried.ceiling() {
+                emptied(&mut c.message);
+                return o.fail(Refusal::failed(FRAME_TOO_LONG));
             }
             c.message.extend_from_slice(bytes);
             if end {
-                // The frame is checked and queued in place; its buffer is kept for the next one.
+                // The frame is checked and queued in place; its buffer is kept for the next one,
+                // up to [`KEEP_BYTES`].
                 let c = &mut *c;
                 let one_line = !c.message.contains(&b'\n') && c.message.last() != Some(&b'\r');
                 if one_line {
                     c.outbound.extend_from_slice(&c.message);
                     c.outbound.push(b'\n');
                 }
-                c.message.clear();
+                emptied(&mut c.message);
                 if !one_line {
                     return o.fail(Refusal::failed(NOT_ONE_LINE));
                 }
                 if let Poll::Ready(Err(e)) = c.drain(&mut io) {
-                    carried.ended(c, now(&inst));
+                    carried.faulted(c, now(&inst));
                     return o.fail(refusal(&e));
                 }
             }
@@ -509,7 +585,7 @@ impl SafeSlot for Flush {
                 Poll::Pending => Outcome::Pending,
                 Poll::Ready(Ok(())) => Outcome::Ready,
                 Poll::Ready(Err(e)) => {
-                    carried.ended(&mut c, now(&inst));
+                    carried.faulted(&mut c, now(&inst));
                     o.fail(refusal(&e))
                 }
             }
@@ -533,11 +609,13 @@ impl SafeSlot for Shut {
         if let Some(held) = gone {
             let mut conn = lock(&held);
             // A member's program found ENDED at its shut (the host's lease found it exited) is an
-            // end; one still running (its output PENDING) is a clean shut, no end.
-            if conn.key != 0 && !conn.counted && !conn.ended && found_ended(&mut io, conn.io) {
+            // end, as is one whose op failed on its side; one still running (its output PENDING)
+            // is a clean shut, no end.
+            let open = !conn.ended && !conn.faulted;
+            if conn.key != 0 && !conn.counted && open && found_ended(&mut io, conn.io) {
                 conn.ended = true;
             }
-            if conn.ended {
+            if conn.ended || conn.faulted {
                 c.ended(&mut conn, now(&inst));
             }
             let _ = io.close(conn.io);
