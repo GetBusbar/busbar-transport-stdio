@@ -19,15 +19,19 @@ use busbar_contract::abi::host::io::{
     HandleIn, IoSlots, ReadIn as IoReadIn, SpawnIn, WriteIn as IoWriteIn, SLOTS,
 };
 use busbar_contract::abi::host::service::ServiceOut;
-use busbar_contract::abi::mechanism::call::{AbiStr, InHead, Op, OutHead, Outcome, RawOutcome};
+use busbar_contract::abi::mechanism::call::{
+    AbiStr, Blob, InHead, Op, OutHead, Outcome, RawOutcome, BLOB_JSON,
+};
 use busbar_contract::abi::mechanism::door::Door;
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::mechanism::lifecycle::{
+    slot as life, OpenIn, OpenOut, RefreshIn, ValidateIn,
+};
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::check::check_tail;
 use busbar_contract::abi::transport::{
     slot, ConnIn, ConnOut, Destination, DialIn, IoOut, ListenIn, ListenOut, Ops, ReadIn, ShutIn,
     TransportTail, WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME, ROLE_CARRIER,
-    WRITE_END_OF_FRAME,
+    SETTING_COUNT, WRITE_END_OF_FRAME,
 };
 use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, NOT_ONE_LINE, STATEMENT, TOO_LONG};
 
@@ -41,6 +45,22 @@ fn s(t: &str) -> AbiStr {
         ptr: t.as_ptr(),
         len: t.len(),
     }
+}
+
+/// `json` as a settings blob (`None`: absent, as the host hands a door that declares none).
+fn settings(json: Option<&str>) -> Blob {
+    let mut b: Blob = z();
+    if let Some(j) = json {
+        b.ptr = j.as_ptr();
+        b.len = j.len();
+        b.fmt = BLOB_JSON;
+    }
+    b
+}
+
+/// The request-body bound `n`, as the host hands it in a settings blob.
+fn body_max(n: usize) -> String {
+    format!("{{\"limits.request_body_max_bytes\":{n}}}")
 }
 
 fn text(t: AbiStr) -> String {
@@ -227,6 +247,11 @@ struct Host {
 
 impl Host {
     fn new(reads: Vec<Option<Vec<u8>>>) -> Self {
+        Self::with_settings(None, reads)
+    }
+
+    /// The carrier opened with the settings blob `json`, its program dialed.
+    fn with_settings(json: Option<&str>, reads: Vec<Option<Vec<u8>>>) -> Self {
         *SCRIPT.lock().unwrap() = Some(Script {
             reads,
             ..Script::default()
@@ -242,6 +267,7 @@ impl Host {
         });
         let mut i: OpenIn = z();
         i.host = &*tables;
+        i.settings = settings(json);
         let mut o: OpenOut = z();
         let r = call(
             ops().head.open,
@@ -304,6 +330,15 @@ impl Host {
         i.flags = WRITE_END_OF_FRAME;
         let mut o: IoOut = z();
         call(ops().write, self.inst, &mut i, &mut o, slot::WRITE)
+    }
+
+    /// Refresh the instance onto the settings blob `json`.
+    fn refresh(&self, json: &str) -> Outcome {
+        let mut i: RefreshIn = z();
+        i.generation = 2;
+        i.settings = settings(Some(json));
+        let mut o: OutHead = z();
+        call(ops().head.refresh, self.inst, &mut i, &mut o, life::REFRESH)
     }
 
     fn write(&self, bytes: &[u8], end: bool) -> (Outcome, String) {
@@ -408,13 +443,15 @@ fn a_frame_goes_out_as_one_line_and_one_that_cannot_be_one_is_refused() {
     assert_eq!(h.write(b"1}", true).0, Outcome::Ready);
     assert_eq!(h.write(b"", true).0, Outcome::Ready);
     with(|sc| assert_eq!(sc.written, b"{\"id\":1}\n\n"));
+    // REFUSED, as a frame past the ceiling is: one outcome class for every frame that cannot be
+    // one line. RED (row 159, stdio NIT): this one FAILED while the ceiling's was REFUSED.
     assert_eq!(
         h.write(b"two\nlines", true),
-        (Outcome::Failed, NOT_ONE_LINE.to_owned())
+        (Outcome::Refused, NOT_ONE_LINE.to_owned())
     );
     assert_eq!(
         h.write(b"a return\r", true),
-        (Outcome::Failed, NOT_ONE_LINE.to_owned())
+        (Outcome::Refused, NOT_ONE_LINE.to_owned())
     );
     with(|sc| {
         assert_eq!(
@@ -535,5 +572,122 @@ fn a_gathered_frame_past_the_line_ceiling_is_refused() {
         answered,
         Outcome::Refused,
         "a frame past the ceiling is refused"
+    );
+}
+
+/// THE LINE CEILING IS THE OPERATOR'S REQUEST-BODY BOUND: the tail declares the one setting the
+/// carrier reads, at its 1.5.5 path (`limits.request_body_max_bytes`), a count whose declared
+/// default is the default ceiling. RED (row 159, stdio MEDIUM M2): the carrier read no setting.
+#[test]
+fn the_tail_declares_the_request_body_bound_it_reads() {
+    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
+    let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
+    assert_eq!(tail.settings_len, 1, "one setting declared");
+    // SAFETY: the tail's own `'static` list, `settings_len` long.
+    let decl = unsafe { &*tail.settings };
+    assert_eq!(text(decl.path), "limits.request_body_max_bytes");
+    assert_eq!(decl.kind, SETTING_COUNT);
+    assert_eq!(text(decl.default), MAX_LINE_BYTES.to_string());
+    assert_eq!(check_tail(tail), Ok(()));
+}
+
+/// A deployment's request-body bound is the line ceiling both ways: a line or a frame of exactly
+/// the bound crosses, one byte more fails the read or is refused at the write. RED (row 159, stdio
+/// MEDIUM M2): the ceiling was a fixed 32 MiB whatever the deployment set.
+#[test]
+fn the_line_ceiling_is_the_deployments_request_body_bound() {
+    let _one = ONE.lock().unwrap();
+    let mut out = vec![b'a'; 64];
+    out.push(b'\n');
+    out.extend_from_slice(&[b'b'; 65]);
+    out.push(b'\n');
+    let h = Host::with_settings(Some(&body_max(64)), vec![Some(out), None]);
+    assert_eq!(
+        h.read(256),
+        (Outcome::Ready, vec![b'a'; 64], true, String::new()),
+        "a line of exactly the bound is one frame"
+    );
+    let (r, _, _, why) = h.read(256);
+    assert_eq!((r, why.as_str()), (Outcome::Failed, TOO_LONG));
+    assert_eq!(h.write(&[b'c'; 64], true).0, Outcome::Ready);
+    assert_eq!(
+        h.write(&[b'd'; 65], true).0,
+        Outcome::Refused,
+        "a frame one byte past the bound"
+    );
+    with(|sc| assert_eq!(sc.written.len(), 65, "only the frame inside the bound left"));
+}
+
+/// A deployment that RAISED the bound past the default carries a line past the default whole.
+/// RED (row 159, stdio MEDIUM M2): a line the deployment's bound admits failed the read.
+#[test]
+fn a_raised_request_body_bound_carries_a_line_past_the_default() {
+    let _one = ONE.lock().unwrap();
+    let mut line = vec![b'x'; MAX_LINE_BYTES + 1];
+    line.push(b'\n');
+    let mut reads: Vec<Option<Vec<u8>>> =
+        line.chunks(16 * 1024).map(|c| Some(c.to_vec())).collect();
+    reads.push(None);
+    let h = Host::with_settings(Some(&body_max(MAX_LINE_BYTES + 1024)), reads);
+    let (r, bytes, end, why) = h.read(64);
+    assert_eq!(
+        (r, bytes.len(), end, why.as_str()),
+        (Outcome::Ready, 64, false, ""),
+        "the line is a frame, answered in pieces"
+    );
+}
+
+/// A config apply moves the ceiling: the refresh's bound holds from the next op on. RED (row 159,
+/// stdio MEDIUM M2).
+#[test]
+fn a_refresh_moves_the_line_ceiling() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    assert_eq!(h.refresh(&body_max(64)), Outcome::Ready);
+    assert_eq!(
+        h.write(&[b'x'; 100], true).0,
+        Outcome::Refused,
+        "the refreshed bound holds"
+    );
+}
+
+/// A bound that is no count of bytes is FAILED at `validate`, before any instance opens on it.
+/// RED (row 159, stdio MEDIUM M2): the carrier validated nothing.
+#[test]
+fn a_request_body_bound_that_is_no_count_fails_validation() {
+    let json = "{\"limits.request_body_max_bytes\":\"big\"}";
+    let mut i: ValidateIn = z();
+    i.settings = settings(Some(json));
+    let mut o: OutHead = z();
+    assert_eq!(
+        call(
+            ops().head.validate,
+            std::ptr::null_mut(),
+            &mut i,
+            &mut o,
+            life::VALIDATE
+        ),
+        Outcome::Failed
+    );
+}
+
+/// A line of exactly the ceiling ended by CRLF is one frame whichever read its CR and its LF
+/// arrive in: a CR still waiting for its LF is the terminator's, not the line's. RED (row 159,
+/// stdio LOW): the read failed when the CR and the LF came in separate reads.
+#[test]
+fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
+    let _one = ONE.lock().unwrap();
+    let line = vec![b'x'; MAX_LINE_BYTES];
+    let mut reads: Vec<Option<Vec<u8>>> =
+        line.chunks(16 * 1024).map(|c| Some(c.to_vec())).collect();
+    reads.push(Some(b"\r".to_vec()));
+    reads.push(Some(b"\n".to_vec()));
+    reads.push(None);
+    let h = Host::new(reads);
+    let (r, bytes, end, why) = h.read(64);
+    assert_eq!(
+        (r, bytes.len(), end, why.as_str()),
+        (Outcome::Ready, 64, false, ""),
+        "a line at the ceiling is a frame"
     );
 }
