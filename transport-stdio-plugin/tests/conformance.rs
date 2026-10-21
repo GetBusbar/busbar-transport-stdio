@@ -11,15 +11,26 @@
 //! crossings exactly at the script's pin, the two folds equal, and the suite's RED arms kept.
 //! `plugin-ci.yml` runs it under `--release`.
 
+use busbar_plugin_loader::dispatch::{LinkedRow, LoadedDoor};
+
+/// This plugin's own door, named for the loader.
+fn loaded_door() -> LoadedDoor {
+    // SAFETY: `busbar_transport_stdio::door` is this crate's own door: it answers the `'static` door
+    // of this plugin.
+    #[allow(unused_unsafe)]
+    let loaded = unsafe { LoadedDoor::from_raw(busbar_transport_stdio::door) };
+    loaded
+}
+
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_stdio::door,
+    loaded: loaded_door(),
     cdylib: "busbar_transport_stdio_plugin",
     inputs: include_str!("conformance.json"),
 }
 
 #[test]
 fn the_statement_carries_the_declares_document() {
-    let row = busbar_plugin_loader::dispatch::LinkedRow::of(busbar_transport_stdio::door).unwrap();
+    let row = LinkedRow::of_loaded(loaded_door()).unwrap();
     let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
     assert_eq!(
         busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
@@ -27,20 +38,21 @@ fn the_statement_carries_the_declares_document() {
     );
 }
 
-/// THE POINTS THE DOOR STATES, as the loader reads them (`dispatch::kinds::transport::stated`, the
-/// reader a bind uses): exactly the auth points the carrier calls, which is none. RED: the door
-/// stated no offered-points record, so the loader read `{Head, HeadBody}`, points a carrier with
-/// no head never calls, and a guest-list line needing them would seal and never be called.
+/// THE POINTS THE DOOR STATES, as its Statement's extensions carry them: exactly the auth points
+/// the carrier calls, which is none. RED: the door stated no offered-points record, so the loader
+/// read `{Head, HeadBody}`, points a carrier with no head never calls, and a guest-list line
+/// needing them would seal and never be called. The record is read off the row's own Statement
+/// (the loader's `transport::stated` reader takes a bare door fn on dev and a `MacroDoor` on
+/// #1471, so no one call spans both).
 #[test]
 fn the_loader_reads_the_points_the_door_calls_and_no_head_point() {
-    use busbar_contract::abi::transport::{AuthPoint, AuthPoints};
-    let facts =
-        busbar_plugin_loader::dispatch::kinds::transport::stated(busbar_transport_stdio::door)
-            .expect("the door's Statement is read");
-    assert!(!facts.offered.has(AuthPoint::Head), "no head point");
-    assert!(
-        !facts.offered.has(AuthPoint::HeadBody),
-        "no head-and-body point"
-    );
-    assert_eq!(facts.offered, AuthPoints::EMPTY);
+    use busbar_contract::abi::transport::{AuthPoints, EXT_OFFERED_POINTS};
+    let row = LinkedRow::of_loaded(loaded_door()).unwrap();
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    let record = busbar_contract::abi::mechanism::extensions::get(
+        &read.extensions.bytes,
+        EXT_OFFERED_POINTS,
+    )
+    .expect("the door states its offered points");
+    assert_eq!(record, AuthPoints::EMPTY.0.to_le_bytes());
 }

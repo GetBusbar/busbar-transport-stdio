@@ -365,7 +365,7 @@ impl SafeSlot for Dial {
         let Some(dest) = i.dest() else {
             return o.fail(Refusal::failed("dial: no destination"));
         };
-        if dest.kind != DEST_PROGRAM {
+        if dest.kind() != DEST_PROGRAM {
             return o.fail(Refusal::refused(
                 "dial: a stdio carrier reaches a program, never an authority",
             ));
@@ -376,7 +376,7 @@ impl SafeSlot for Dial {
         };
         // THE SUPERVISOR: a member's program is spawned only when its policy lets it restart, on
         // the host's clock; a member with no clock to be supervised by is not run unsupervised.
-        let key = i.supervision_key;
+        let key = i.supervision_key();
         let at = if key == 0 {
             None
         } else {
@@ -424,7 +424,7 @@ impl SafeSlot for Read {
     type Out = IoOut;
     type State = State;
     fn call(inst: Instance<'_, State>, i: Lent<'_, ReadIn>, mut o: Out<'_, IoOut>) -> Outcome {
-        over!(inst, o, i.conn, |carried, io, c| {
+        over!(inst, o, i.conn(), |carried, io, c| {
             let mut buf = i.buf();
             loop {
                 if let Some(mut line) = c.line {
@@ -480,8 +480,8 @@ impl SafeSlot for Write {
     type State = State;
     fn call(inst: Instance<'_, State>, i: Lent<'_, WriteIn>, mut o: Out<'_, IoOut>) -> Outcome {
         let bytes = i.bytes();
-        let end = i.flags & WRITE_END_OF_FRAME != 0;
-        over!(inst, o, i.conn, |carried, io, c| {
+        let end = i.flags() & WRITE_END_OF_FRAME != 0;
+        over!(inst, o, i.conn(), |carried, io, c| {
             // What the pipe has not taken goes first; past the cap, nothing more is taken.
             match c.drain(&mut io) {
                 Poll::Ready(Err(e)) => {
@@ -529,7 +529,7 @@ impl SafeSlot for Flush {
     type Out = OutHead;
     type State = State;
     fn call(inst: Instance<'_, State>, i: Lent<'_, ConnIn>, mut o: Out<'_, OutHead>) -> Outcome {
-        over!(inst, o, i.conn, |carried, io, c| {
+        over!(inst, o, i.conn(), |carried, io, c| {
             match c.drain(&mut io) {
                 Poll::Pending => Outcome::Pending,
                 Poll::Ready(Ok(())) => Outcome::Ready,
@@ -554,7 +554,7 @@ impl SafeSlot for Shut {
             Ok(x) => x,
             Err(r) => return o.fail(r),
         };
-        let gone = lock(&c.conns).remove(&i.conn);
+        let gone = lock(&c.conns).remove(&i.conn());
         if let Some(held) = gone {
             let mut conn = lock(&held);
             // A member's program found ENDED at its shut (the host's lease found it exited) is an
@@ -585,7 +585,9 @@ impl SafeSlot for Arrival {
         i: Lent<'_, ArrivalIn>,
         mut o: Out<'_, ArrivalOut>,
     ) -> Outcome {
-        let known = inst.get().is_some_and(|h| h.life().conn(i.conn).is_some());
+        let known = inst
+            .get()
+            .is_some_and(|h| h.life().conn(i.conn()).is_some());
         if known {
             Outcome::Ready
         } else {
