@@ -2,10 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE STDIO SUPERVISOR (`BUSBAR-1.6.0.md` THE DESIGN §2, l.388: "the stdio supervisor is the stdio
-//! transport's"): the restart policy of a program that keeps ending, new in 1.6.0 (1.5.5 spawned no
-//! program). Its figures are `predev`'s, the baseline of the MCP path (THE DESIGN l.380): the
-//! pre-fold stdio MCP client's restart policy (a 100 ms backoff doubling to 30 s, five ends inside a
-//! minute tripping its breaker). A circuit breaker, not a retry loop: each end is
+//! transport's"): the restart policy of a program that keeps ending, the crash-loop policy predev's
+//! connector held (`program.rs`, the MCP baseline, FOLD-MCP F25) before it moved here; v1.5.5 had
+//! no stdio transport and no program supervisor. A circuit breaker, not a retry loop: each end is
 //! timed on the host's one clock (monotonic, `clock.now`, THE DESIGN §1 and l.291); the next spawn
 //! waits a backoff doubling from [`BASE_BACKOFF_NS`] to [`MAX_BACKOFF_NS`], and [`CRASH_THRESHOLD`]
 //! ends inside [`CRASH_WINDOW_NS`] TRIP it: the restarts stop, never on a timeout, whether or not

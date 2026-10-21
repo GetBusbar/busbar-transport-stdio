@@ -17,7 +17,9 @@
 //! (ii) a member dropped and re-added is a new key, fresh;
 //! (iii) a rotated secret value (a different environment value under the same member) does NOT
 //!      reset a trip.
-//! A clean shut of a running program is not an end; a key of `0` (no member) is not supervised.
+//! A clean shut of a running program is not an end; a key of `0` (no member) is not supervised. A
+//! read the program fails (a line past the ceiling) is an end, as predev counted every end of a
+//! generation the member did not ask for, failures included.
 //!
 //! RED before the supervisor moved here: the carrier spawned whatever it was asked to, every time.
 
@@ -37,6 +39,14 @@ use busbar_contract::abi::transport::{
     slot, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, DEST_PROGRAM,
 };
 use busbar_transport_stdio::door;
+
+/// The line ceiling when the host hands none: the host's default request-body bound (32 MiB), stated
+/// as a literal because the crate's only public item is `door`; the crate holds its own constant
+/// equal to this number against the default it declares.
+const MAX_LINE_BYTES: usize = 33_554_432;
+
+/// Why a read fails when a program's line runs past the ceiling.
+const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
 
 const MS: u64 = 1_000_000;
 
@@ -98,6 +108,9 @@ struct Script {
     spawns: u32,
     /// Whether `clock.now` fails.
     clock_fails: bool,
+    /// Full reads of output (`x`, as many bytes as the carrier lends) answered before the read
+    /// that finds the program ended or running.
+    flood: usize,
 }
 
 static SCRIPT: Mutex<Script> = Mutex::new(Script {
@@ -107,6 +120,7 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     next_handle: 1,
     spawns: 0,
     clock_fails: false,
+    flood: 0,
 });
 static ONE: Mutex<()> = Mutex::new(());
 
@@ -139,7 +153,12 @@ extern "C" fn io_spawn(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> Ra
 
 extern "C" fn io_read(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
-    let _ = unsafe { input.cast::<IoReadIn>().read() };
+    let i = unsafe { input.cast::<IoReadIn>().read() };
+    if with(|sc| sc.flood.checked_sub(1).map(|n| sc.flood = n).is_some()) {
+        // SAFETY: the carrier's buffer, `cap` bytes.
+        unsafe { std::ptr::write_bytes(i.buf, b'x', i.cap) };
+        return answer(out, Outcome::Ready, 0, i.cap as u64);
+    }
     if with(|sc| sc.ended) {
         answer(out, Outcome::Ready, 0, 0)
     } else {
@@ -207,6 +226,7 @@ impl Carrier {
             next_handle: 1,
             spawns: 0,
             clock_fails: false,
+            flood: 0,
         };
         let tables = Box::new(HostTables {
             size: size_of::<HostTables>() as u32,
@@ -278,13 +298,26 @@ impl Carrier {
 
     /// Read `conn` once: with the script's `ended`, the program's end (a clean `len` `0`).
     fn read(&self, conn: u64) -> Outcome {
+        self.read_why(conn).0
+    }
+
+    /// Read `conn` once: the outcome and why.
+    fn read_why(&self, conn: u64) -> (Outcome, String) {
         let mut buf = [0_u8; 64];
         let mut i: ReadIn = z();
         i.conn = conn;
         i.buf = buf.as_mut_ptr();
         i.cap = buf.len();
         let mut o: IoOut = z();
-        call(ops().read, self.inst, &mut i, &mut o, slot::READ)
+        let r = call(ops().read, self.inst, &mut i, &mut o, slot::READ);
+        let why = if o.head.error.len == 0 {
+            String::new()
+        } else {
+            // SAFETY: the carrier's string, live for the call.
+            let b = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
+            String::from_utf8_lossy(b).into_owned()
+        };
+        (r, why)
     }
 
     /// A config apply: the instance's `refresh`.
@@ -567,5 +600,84 @@ fn the_held_down_refusal_counts_the_ends_and_names_the_hold() {
         why,
         "dial: the stdio supervisor tripped when the program ended 5 times within a minute; it \
          stays stopped until the member's command changes"
+    );
+}
+
+/// Full reads of output (the carrier reads 16 KiB at a time) that carry a member's line past the
+/// stdio line ceiling ([`MAX_LINE_BYTES`]).
+fn past_the_ceiling() -> usize {
+    MAX_LINE_BYTES / (16 * 1024) + 1
+}
+
+/// A program whose line runs past the ceiling fails the read, and that failure is an END of its
+/// program, counted then: the host ends the generation and shuts a program that is still running,
+/// which would otherwise read as a clean shut. RED (row 159, stdio MEDIUM M1): the read failed
+/// uncounted, so a program writing an endless line was respawned on every lease with no backoff
+/// and never held down.
+#[test]
+fn a_line_past_the_ceiling_is_an_end() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    let (r, conn) = c.dial(70, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.flood = past_the_ceiling();
+    });
+    assert_eq!(
+        c.read_why(conn),
+        (Outcome::Failed, TOO_LONG.to_owned()),
+        "the line ran past the ceiling"
+    );
+    c.shut(conn);
+    assert_eq!(
+        c.dial(70, "a").0,
+        Outcome::Refused,
+        "held down after the read the program failed"
+    );
+}
+
+/// A read the program failed while the host's clock did not answer is counted once it answers
+/// (here, at the shut of the still-running program). RED (row 159, stdio MEDIUM M1).
+#[test]
+fn a_line_past_the_ceiling_met_without_a_clock_is_counted_at_the_shut() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    let (r, conn) = c.dial(71, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.clock_fails = true;
+        sc.flood = past_the_ceiling();
+    });
+    assert_eq!(c.read(conn), Outcome::Failed);
+    with(|sc| sc.clock_fails = false);
+    c.shut(conn);
+    assert_eq!(
+        c.dial(71, "a").0,
+        Outcome::Refused,
+        "the failed read was counted at the shut"
+    );
+}
+
+/// A program that exited behind a FULL pipe (1 MiB, the most an unprivileged program can size its
+/// own pipe to, which the host reads directly and holds none of) is found ended at its shut: the
+/// probe reads the pipe empty and then the read that finds the end. RED (row 159, stdio LOW): the
+/// probe stopped after exactly 1 MiB, one read before the end, and read the program as running.
+#[test]
+fn a_program_that_exited_behind_a_full_pipe_is_found_ended_at_its_shut() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    let (r, conn) = c.dial(80, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = true;
+        sc.flood = 1024 * 1024 / (16 * 1024);
+    });
+    c.shut(conn);
+    assert_eq!(
+        c.dial(80, "a").0,
+        Outcome::Refused,
+        "its end behind a full pipe was counted at the shut"
     );
 }
