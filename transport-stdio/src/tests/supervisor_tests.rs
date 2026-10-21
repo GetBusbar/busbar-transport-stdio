@@ -99,7 +99,7 @@ fn trip(m: &mut Supervised, key: u64, mut now: u64) -> u64 {
 
 /// A TRIP NEVER TIMES OUT; THE OPERATOR'S CONFIG APPLY CLEARS IT (`predev` cleared a trip only by
 /// an operator's re-approval, never on a timeout). Between refreshes a tripped key is kept and
-/// refused, an hour of silence later; a refresh clears the trip and rebuilds the map from the
+/// refused after an hour of silence; a refresh clears the trip and rebuilds the map from the
 /// programs running, so the keys of members declared anew are gone after it. RED: a refresh
 /// cleared nothing, and a tripped key was kept for the instance's life, one more for every
 /// re-declaration.
