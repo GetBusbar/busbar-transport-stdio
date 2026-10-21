@@ -43,14 +43,14 @@ fn z<T>() -> T {
 }
 
 fn s(t: &str) -> AbiStr {
-    AbiStr {
-        ptr: t.as_ptr(),
-        len: t.len(),
-    }
+    // SAFETY: `t` is the test's own text, live for every call it is passed to.
+    unsafe { AbiStr::from_raw_parts(t.as_ptr(), t.len()) }
 }
 
 fn ops() -> &'static Ops {
-    let d: *const Door = door();
+    // SAFETY: `door()` answers the `'static` door of this crate.
+    #[allow(unused_unsafe)]
+    let d: *const Door = unsafe { door() };
     // SAFETY: the door answers a `'static` door whose table is this kind's `Ops`.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -68,11 +68,15 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         let oh = std::ptr::from_mut(o).cast::<OutHead>();
         (*oh).size = size_of::<O>() as u32;
     }
-    (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    )
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    }
     .outcome()
 }
 

@@ -350,7 +350,7 @@ impl SafeSlot for Dial {
         };
         // THE SUPERVISOR: a member's program is spawned only when its policy lets it restart, on
         // the host's clock; a member with no clock to be supervised by is not run unsupervised.
-        let key = i.supervision_key;
+        let key = i.supervision_key();
         let at = if key == 0 {
             None
         } else {
