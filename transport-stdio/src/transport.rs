@@ -24,7 +24,8 @@
 //!   forgets the connection; `arrival` answers no far end and no port.
 //! * THE SUPERVISOR is this carrier's (THE DESIGN §2, l.388; [`crate::supervisor`]): a dial for a
 //!   member (`DialIn::supervision_key` not `0`) is REFUSED while that member's program is held
-//!   down (a member's state is kept only while its program runs or a hold runs), and every end of it — its output closed, a failed pipe, a failed spawn, or found ended
+//!   down (a trip holds until the operator applies the configuration again, the instance's
+//!   `refresh`), and every end of it — its output closed, a failed pipe, a failed spawn, or found ended
 //!   when it is shut — is counted on the host's one clock. A clean shut of a running program is no
 //!   end.
 
@@ -81,8 +82,8 @@ pub fn held_down(hold: Hold) -> String {
             remaining_ns.div_ceil(1_000_000)
         ),
         Hold::Tripped { ends } => format!(
-            "dial: the program ended {} within a minute; the stdio supervisor holds its restarts \
-             down while it keeps asking",
+            "dial: the program ended {} within a minute; the stdio supervisor stopped its \
+             restarts until the configuration is applied again",
             ended(ends)
         ),
     }
@@ -185,7 +186,10 @@ impl Life for Carried {
         })
     }
 
+    /// The operator applied the configuration again: every trip the supervisor holds is cleared
+    /// (`predev`'s operator re-approval), and its map rebuilt from the programs running.
     fn refresh(&self, _: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
+        lock(&self.supervised).refresh();
         Ok(Refreshed::default())
     }
 }
@@ -379,8 +383,8 @@ impl SafeSlot for Dial {
             let Some(at) = now(&inst) else {
                 return o.fail(Refusal::failed(NO_CLOCK));
             };
-            // A key whose state holds nothing reads as a fresh one: dropped, so the map holds only
-            // members with a program running or a hold running.
+            // A key whose state holds nothing reads as a fresh one: dropped, so between refreshes
+            // the map holds only members with a program running, a hold running or a trip.
             let hold = lock(&c.supervised).admit(key, at);
             if let Some(hold) = hold {
                 return o.fail(Refusal::refused(held_down(hold)));

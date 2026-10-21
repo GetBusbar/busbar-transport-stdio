@@ -8,8 +8,10 @@
 //! minute tripping its breaker). A circuit breaker, not a retry loop: each end is
 //! timed on the host's one clock (monotonic, `clock.now`, THE DESIGN §1 and l.291); the next spawn
 //! waits a backoff doubling from [`BASE_BACKOFF_NS`] to [`MAX_BACKOFF_NS`], and [`CRASH_THRESHOLD`]
-//! ends inside [`CRASH_WINDOW_NS`] stop the restarts while the member keeps asking for them: every
-//! dial the trip refuses renews it.
+//! ends inside [`CRASH_WINDOW_NS`] TRIP it: the restarts stop until the operator applies the
+//! configuration again (the instance's `refresh`), never on a timeout, whether or not the member
+//! keeps asking. `predev` cleared a trip only by an operator's explicit re-approval; the 1.6.0
+//! operator's act is the config apply, which clears every trip ([`Supervised::refresh`]).
 //!
 //! One supervisor per SUPERVISION KEY (`DialIn::supervision_key`): the host mints a key for each
 //! member and keeps it while the member's program is unchanged across re-declarations, so the
@@ -40,7 +42,8 @@ pub enum Hold {
         /// How long until the backoff passes.
         remaining_ns: u64,
     },
-    /// `ends` ends inside the window tripped it: no restart while the member keeps asking.
+    /// `ends` ends inside the window tripped it: no restart until the configuration is applied
+    /// again.
     Tripped {
         /// The ends counted inside the window when it tripped.
         ends: usize,
@@ -52,13 +55,12 @@ pub enum Hold {
 pub struct Supervisor {
     /// Its programs running now: connections dialled and not yet shut.
     live: usize,
-    /// The last dial a trip refused: the trip holds a full window past it.
-    asked: u64,
     /// The ends inside the window, oldest first.
     crashes: Vec<u64>,
     /// No spawn before this instant.
     restart_at: Option<u64>,
-    /// [`CRASH_THRESHOLD`] ends inside the window: no restart while the member keeps asking.
+    /// [`CRASH_THRESHOLD`] ends inside the window: no restart until the configuration is applied
+    /// again.
     tripped: bool,
 }
 
@@ -82,27 +84,16 @@ impl Supervisor {
     }
 
     /// Whether it holds nothing at `now`, so its key's state may be dropped: no program of its
-    /// member running, and no hold running. A hold runs while a backoff is pending or an end is
-    /// inside the window; a trip runs for a whole window past its last end and past the last dial
-    /// it refused, so a member that keeps asking stays held down. A member declared anew dials
-    /// under a fresh key and its old key is never dialled again: its state is dropped once its
-    /// hold has run out, and the map holds only live members and running holds.
+    /// member running, no backoff pending, no end inside the window, and not tripped. A trip is
+    /// kept until the next refresh, never dropped on a timeout.
     pub fn idle(&self, now: u64) -> bool {
-        let quiet = |t: u64| now.saturating_sub(t) > CRASH_WINDOW_NS;
         self.live == 0
+            && !self.tripped
             && self.restart_at.is_none_or(|at| now >= at)
-            && self.crashes.iter().all(|t| quiet(*t))
-            && (!self.tripped || quiet(self.asked))
-    }
-
-    /// What holds the program down at `now`, if anything: the ends counted and how long. A trip
-    /// that refuses this dial is renewed by it.
-    pub fn admit(&mut self, now: u64) -> Option<Hold> {
-        let hold = self.hold(now);
-        if matches!(hold, Some(Hold::Tripped { .. })) {
-            self.asked = self.asked.max(now);
-        }
-        hold
+            && self
+                .crashes
+                .iter()
+                .all(|t| now.saturating_sub(*t) > CRASH_WINDOW_NS)
     }
 
     /// What holds the program down at `now`, if anything: the ends counted and how long.
@@ -124,9 +115,10 @@ impl Supervisor {
     }
 }
 
-/// EVERY MEMBER'S SUPERVISION, by its supervision key: an entry only while its member has a
-/// program running or a hold running ([`Supervisor::idle`]), so the map is bounded by the live
-/// members and their running holds, however many times members are declared anew.
+/// EVERY MEMBER'S SUPERVISION, by its supervision key. Between refreshes an entry is kept while
+/// its member has a program running, a hold running or a trip ([`Supervisor::idle`]); a refresh
+/// (the operator's config apply) clears every trip and rebuilds the map from the programs running,
+/// so the keys of members declared anew never outlive the apply that retired them.
 #[derive(Debug, Default)]
 pub struct Supervised {
     by_key: HashMap<u64, Supervisor>,
@@ -141,7 +133,27 @@ impl Supervised {
     /// A dial for the member `key` at `now`: what holds it down, if anything.
     pub fn admit(&mut self, key: u64, now: u64) -> Option<Hold> {
         self.sweep(now);
-        self.by_key.get_mut(&key).and_then(|s| s.admit(now))
+        self.by_key.get(&key).and_then(|s| s.hold(now))
+    }
+
+    /// THE OPERATOR'S RE-APPROVAL: the configuration was applied again (the instance's
+    /// `refresh`). Every trip, backoff and counted end is cleared; only the programs running now
+    /// are kept, each under a fresh supervisor.
+    pub fn refresh(&mut self) {
+        self.by_key = self
+            .by_key
+            .drain()
+            .filter(|(_, s)| s.live > 0)
+            .map(|(key, s)| {
+                (
+                    key,
+                    Supervisor {
+                        live: s.live,
+                        ..Supervisor::default()
+                    },
+                )
+            })
+            .collect();
     }
 
     /// The member `key`'s program was spawned: it runs until its connection is shut.

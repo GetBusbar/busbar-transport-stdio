@@ -47,10 +47,10 @@ fn ends_outside_the_window_are_forgotten() {
 }
 
 /// A supervisor holding no end inside the window and no pending backoff is idle (it reads as a
-/// fresh one, so its key's state may be dropped); a tripped one is not while its hold runs, and
-/// every dial the trip refuses renews it; one with a program running never is.
+/// fresh one, so its key's state may be dropped); a tripped one never is, however long after, and
+/// one with a program running never is.
 #[test]
-fn a_supervisor_with_nothing_to_hold_is_idle_and_a_running_hold_is_not() {
+fn a_supervisor_with_nothing_to_hold_is_idle_and_a_trip_never_is() {
     let mut s = Supervisor::default();
     assert!(s.idle(0));
     s.crashed(0);
@@ -64,23 +64,8 @@ fn a_supervisor_with_nothing_to_hold_is_idle_and_a_running_hold_is_not() {
         t.crashed(k * MS);
     }
     assert!(
-        !t.idle(4 * MS + CRASH_WINDOW_NS),
-        "a trip inside the window after its last end"
-    );
-    let asked = 50_000 * MS;
-    assert_eq!(t.admit(asked), Some(Hold::Tripped { ends: 5 }));
-    assert!(
-        !t.idle(asked + CRASH_WINDOW_NS),
-        "a refused dial renews the trip: never shortened"
-    );
-    assert_eq!(
-        t.hold(asked + CRASH_WINDOW_NS),
-        Some(Hold::Tripped { ends: 5 }),
-        "still tripped"
-    );
-    assert!(
-        t.idle(asked + CRASH_WINDOW_NS + 1),
-        "a trip nobody asked about for a whole window has run out"
+        !t.idle(1_000 * CRASH_WINDOW_NS),
+        "a trip is never dropped on a timeout"
     );
     let running = Supervisor {
         live: 1,
@@ -99,40 +84,47 @@ impl Supervised {
     }
 }
 
-/// THE MAP IS BOUNDED BY THE LIVE MEMBERS AND THE RUNNING HOLDS: a member that crash-loops and is
-/// declared anew (a fresh supervision key) over and over leaves no entry behind once its old key's
-/// hold has run out, on the host's clock, and a member whose program runs keeps its entry. RED: a
-/// tripped key was kept for the instance's life, one more for every re-declaration.
+/// Trip the member `key`: five ends a second apart, each after its backoff. Answers the instant
+/// after the trip.
+fn trip(m: &mut Supervised, key: u64, mut now: u64) -> u64 {
+    for _ in 0..CRASH_THRESHOLD {
+        assert_eq!(m.admit(key, now), None, "key {key} may start");
+        m.spawned(key);
+        m.crashed(key, now);
+        m.closed(key);
+        now += 1_000 * MS;
+    }
+    now
+}
+
+/// A TRIP NEVER TIMES OUT; THE OPERATOR'S CONFIG APPLY CLEARS IT (`predev` cleared a trip only by
+/// an operator's re-approval, never on a timeout). Between refreshes a tripped key is kept and
+/// refused, an hour of silence later; a refresh clears the trip and rebuilds the map from the
+/// programs running, so the keys of members declared anew are gone after it. RED: a refresh
+/// cleared nothing, and a tripped key was kept for the instance's life, one more for every
+/// re-declaration.
 #[test]
-fn members_declared_anew_leave_no_supervision_behind_once_their_holds_run_out() {
+fn a_refresh_clears_every_trip_and_keeps_only_the_programs_running() {
     let mut m = Supervised::default();
     let mut now = 1_000 * MS;
-    // A member whose program runs: the baseline.
+    // A member whose program runs.
     assert_eq!(m.admit(1, now), None);
     m.spawned(1);
-    let baseline = m.keys();
-    assert_eq!(baseline, 1);
     // Ten re-declarations of a crash-looping member, each under a fresh key, each tripped.
     for key in 100..110 {
-        for _ in 0..CRASH_THRESHOLD {
-            assert_eq!(m.admit(key, now), None, "key {key} may start");
-            m.spawned(key);
-            m.crashed(key, now);
-            m.closed(key);
-            now += 1_000 * MS;
-        }
-        assert!(
-            matches!(m.admit(key, now), Some(Hold::Tripped { .. })),
-            "key {key} tripped"
-        );
+        now = trip(&mut m, key, now);
+        assert!(matches!(m.admit(key, now), Some(Hold::Tripped { .. })));
     }
-    assert!(m.keys() > baseline, "the running holds are kept");
-    // The newest trip is still running: it holds, and is never shortened.
-    assert!(matches!(m.admit(109, now), Some(Hold::Tripped { .. })));
-    // The holds run out on the host's clock; the live member stays.
-    now += CRASH_WINDOW_NS + 1;
+    // An hour of silence: every trip still holds, and is kept.
+    now += 3_600_000 * MS;
     m.sweep(now);
-    assert_eq!(m.keys(), baseline, "back to the live members");
+    assert_eq!(m.keys(), 11, "the live member and every trip");
+    assert!(matches!(m.admit(100, now), Some(Hold::Tripped { .. })));
+    // The operator applies the configuration again.
+    m.refresh();
+    assert_eq!(m.keys(), 1, "only the program running is kept");
+    assert_eq!(m.admit(100, now), None, "the trip is cleared");
+    assert_eq!(m.admit(1, now), None);
     // Its program shut, and nothing held, the live member's entry goes too.
     m.closed(1);
     m.sweep(now);

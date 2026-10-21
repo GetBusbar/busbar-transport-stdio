@@ -6,7 +6,8 @@
 //! read that answers the program's end or PENDING while it runs) and its one clock (`clock.now`,
 //! monotonic, set by the test). The figures are `predev`'s (the pre-fold stdio MCP client's restart
 //! policy; 1.5.5 spawned no program): a program that ends is held down under a backoff doubling
-//! from 100 ms, and five ends inside a minute stop its restarts while its member keeps asking.
+//! from 100 ms, and five ends inside a minute stop its restarts, never on a timeout, until the
+//! operator applies the configuration again (the instance's `refresh`).
 //! A dial the policy holds down is REFUSED, saying how many ends it counted and how long it holds.
 //!
 //! The policy is kept per SUPERVISION KEY (`DialIn::supervision_key`), the member identity the host
@@ -29,7 +30,7 @@ use busbar_contract::abi::mechanism::call::{
     AbiStr, Field, InHead, Op, OutHead, Outcome, RawOutcome,
 };
 use busbar_contract::abi::mechanism::door::Door;
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut, RefreshIn};
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::{
     slot, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, DEST_PROGRAM,
@@ -281,6 +282,17 @@ impl Carrier {
         call(ops().read, self.inst, &mut i, &mut o, slot::READ)
     }
 
+    /// The operator applies the configuration again: the instance's `refresh`.
+    fn refresh(&self) {
+        let mut i: RefreshIn = z();
+        i.generation = 2;
+        let mut o: OutHead = z();
+        assert_eq!(
+            call(ops().head.refresh, self.inst, &mut i, &mut o, life::REFRESH),
+            Outcome::Ready
+        );
+    }
+
     fn shut(&self, conn: u64) {
         let mut i: ShutIn = z();
         i.conn = conn;
@@ -317,7 +329,8 @@ fn advance(ns: u64) {
 // ── the tests ────────────────────────────────────────────────────────────────────────────────────
 
 /// A program that ends is held down for 100 ms, doubling; the fifth end inside a minute stops its
-/// restarts while its member keeps asking (dialled every 30 s for an hour, it is still refused).
+/// restarts with no timeout: dialled every 30 s for an hour, then silent for an hour, it is still
+/// refused. RED: a trip nobody dialled for a minute was dropped, and the next dial spawned.
 #[test]
 fn a_program_that_keeps_ending_is_held_down_then_stopped() {
     let _one = ONE.lock().unwrap();
@@ -350,6 +363,30 @@ fn a_program_that_keeps_ending_is_held_down_then_stopped() {
             "five ends in a minute: stopped while it keeps asking"
         );
     }
+    advance(3_600_000 * MS);
+    assert_eq!(
+        c.dial(1, "a").0,
+        Outcome::Refused,
+        "an hour of silence: still stopped"
+    );
+}
+
+/// THE OPERATOR'S CONFIG APPLY CLEARS A TRIP (`predev` cleared one only by an operator's
+/// re-approval): after the instance's `refresh` the tripped member's next dial spawns its program.
+/// RED: a refresh cleared nothing.
+#[test]
+fn a_refresh_clears_a_trip_and_the_next_dial_spawns() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    c.trip(80, "a");
+    assert_eq!(c.dial(80, "a").0, Outcome::Refused, "tripped");
+    c.refresh();
+    let spawns = with(|sc| sc.spawns);
+    let (r, conn) = c.dial(80, "a");
+    assert_eq!(r, Outcome::Ready, "the trip is cleared");
+    assert_eq!(with(|sc| sc.spawns), spawns + 1, "the program is spawned");
+    with(|sc| sc.ended = false);
+    c.shut(conn);
 }
 
 /// A spawn that fails is counted like any end.
@@ -498,7 +535,7 @@ fn the_held_down_refusal_counts_the_ends_and_names_the_hold() {
     assert_eq!(r, Outcome::Refused);
     assert_eq!(
         why,
-        "dial: the program ended 5 times within a minute; the stdio supervisor holds its \
-         restarts down while it keeps asking"
+        "dial: the program ended 5 times within a minute; the stdio supervisor stopped its \
+         restarts until the configuration is applied again"
     );
 }
