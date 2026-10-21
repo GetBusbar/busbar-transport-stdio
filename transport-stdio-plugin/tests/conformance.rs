@@ -26,3 +26,21 @@ fn the_statement_carries_the_declares_document() {
         Some(&include_bytes!("../../transport-stdio/declares.json")[..]),
     );
 }
+
+/// THE POINTS THE DOOR STATES, as the loader reads them (`dispatch::kinds::transport::stated`, the
+/// reader a bind uses): exactly the auth points the carrier calls, which is none. RED: the door
+/// stated no offered-points record, so the loader read `{Head, HeadBody}`, points a carrier with
+/// no head never calls, and a guest-list line needing them would seal and never be called.
+#[test]
+fn the_loader_reads_the_points_the_door_calls_and_no_head_point() {
+    use busbar_contract::abi::transport::{AuthPoint, AuthPoints};
+    let facts =
+        busbar_plugin_loader::dispatch::kinds::transport::stated(busbar_transport_stdio::door)
+            .expect("the door's Statement is read");
+    assert!(!facts.offered.has(AuthPoint::Head), "no head point");
+    assert!(
+        !facts.offered.has(AuthPoint::HeadBody),
+        "no head-and-body point"
+    );
+    assert_eq!(facts.offered, AuthPoints::EMPTY);
+}

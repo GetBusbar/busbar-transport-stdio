@@ -12,12 +12,14 @@
 //! * `read` answers ONE FRAME PER LINE: the bytes up to each `0x0A`, the newline (and one carriage
 //!   return before it) stripped; the read that completes a line carries `READ_END_OF_FRAME`, and a
 //!   line longer than the host's buffer comes in several reads. A blank line is an empty frame. A
-//!   line past [`MAX_LINE_BYTES`] fails the read. At the program's end a final unterminated line
-//!   is a frame, then the clean end (`len` `0`, no frame bit).
+//!   line past [`MAX_LINE_BYTES`] fails the read. A program whose output ends on a line boundary
+//!   answers the clean end (`len` `0`, no frame bit); one whose output ends part way through a
+//!   line FAILS the read ([`MID_LINE`]): the cut-off bytes are never answered as a frame.
 //! * `write` gathers a frame's bytes until `WRITE_END_OF_FRAME`, then queues them as ONE line, the
 //!   `0x0A` appended. A frame holding a newline, or ending in a carriage return, cannot be one line
-//!   and is refused before a byte of it is written. What the pipe has not taken is written by the
-//!   next `write` or `flush`.
+//!   and FAILS the write before a byte of it is written (FAILED: the answer busbar's published
+//!   carrier conformance script holds a carrier's refused frame to). What the pipe has not taken
+//!   is written by the next `write` or `flush`.
 //! * `flush` writes what is queued; `shut` closes the handle (the host kills the program) and
 //!   forgets the connection; `arrival` answers no far end and no port.
 //! * THE SUPERVISOR is this carrier's (THE DESIGN §2, l.388; [`crate::supervisor`]): a dial for a
@@ -32,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
-use crate::supervisor::Supervisor;
+use crate::supervisor::{Hold, Supervisor};
 use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
 use busbar_contract::abi::mechanism::ticket::CompletionHandle;
 use busbar_contract::abi::sdk::door::{AbiIn, AbiOut};
@@ -58,11 +60,33 @@ pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
 /// How many bytes one pipe read takes.
 const READ_CHUNK: usize = 16 * 1024;
 
-/// Why a member's dial is refused while its program is held down.
-pub const HELD_DOWN: &str =
-    "dial: the program keeps ending; its restarts are held down by the stdio supervisor";
 /// Why a member's dial fails with no host clock to supervise it by.
 pub const NO_CLOCK: &str = "dial: the host lent this carrier no clock to supervise a program by";
+
+/// Why a member's dial is refused while the stdio supervisor holds its program down: how many
+/// ends it counted inside its window, and how long the hold lasts.
+pub fn held_down(hold: Hold) -> String {
+    let ended = |n: usize| {
+        if n == 1 {
+            "once".to_owned()
+        } else {
+            format!("{n} times")
+        }
+    };
+    match hold {
+        Hold::Backoff { ends, remaining_ns } => format!(
+            "dial: the program ended {} within a minute; the stdio supervisor holds its restart \
+             for another {} ms",
+            ended(ends),
+            remaining_ns.div_ceil(1_000_000)
+        ),
+        Hold::Tripped { ends } => format!(
+            "dial: the program ended {} within a minute; the stdio supervisor holds its restarts \
+             down until the member is declared anew",
+            ended(ends)
+        ),
+    }
+}
 
 /// Reads a program's output may take to find its end at a shut, at most: past it, it is running.
 const SHUT_PROBE_READS: usize = 64;
@@ -83,6 +107,10 @@ fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
 
 /// Why a read fails.
 pub const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
+/// Why a read fails when the program's output ends part way through a line: the bytes cut off
+/// are no message (the pre-fold stdio client's own answer to a child that died mid-write).
+pub const MID_LINE: &str =
+    "the program closed its stdout mid-message; a truncated line is not a frame";
 /// Why a write is refused when the frame it gathers passes the line ceiling.
 pub const FRAME_TOO_LONG: &str = "a frame ran past the stdio line ceiling";
 /// Why a write is refused.
@@ -172,7 +200,7 @@ impl Carried {
     }
 
     /// The member `key`'s program ended at `now`: counted once per connection.
-    /// An end met while the host's clock does not answer stays uncounted, so a later read or the
+    /// An end met while the host's clock does not answer stays uncounted, so a following read or the
     /// connection's shut counts it.
     fn ended(&self, c: &mut Conn, now: Option<u64>) {
         if c.key == 0 || c.counted {
@@ -236,9 +264,10 @@ macro_rules! over {
 }
 
 impl Conn {
-    /// The next whole line in `inbound` (the newline and a carriage return before it stripped);
-    /// at the program's end, the unterminated rest. Scans only the bytes no earlier scan saw.
-    /// `Err` for a line past [`MAX_LINE_BYTES`].
+    /// The next whole line in `inbound` (the newline and a carriage return before it stripped).
+    /// Scans only the bytes no earlier scan saw. `Err` for a line past [`MAX_LINE_BYTES`], and for
+    /// an unterminated rest at the program's end ([`MID_LINE`]): a program that died part way
+    /// through a line wrote no message.
     fn next_line(&mut self) -> Result<Option<Line>, &'static str> {
         let from = self.scanned.max(self.head);
         match self.inbound[from..].iter().position(|&b| b == b'\n') {
@@ -264,11 +293,7 @@ impl Conn {
                 if rest > MAX_LINE_BYTES {
                     Err(TOO_LONG)
                 } else if self.ended && rest > 0 {
-                    Ok(Some(Line {
-                        at: self.head,
-                        end: self.inbound.len(),
-                        next: self.inbound.len(),
-                    }))
+                    Err(MID_LINE)
                 } else {
                     Ok(None)
                 }
@@ -357,15 +382,15 @@ impl SafeSlot for Dial {
             let Some(at) = now(&inst) else {
                 return o.fail(Refusal::failed(NO_CLOCK));
             };
-            let held_down = {
+            let hold = {
                 let mut supervised = lock(&c.supervised);
                 // A key whose state holds nothing reads as a fresh one: dropped, so the map holds
                 // only members inside their window and members held down until declared anew.
                 supervised.retain(|_, s| !s.idle(at));
-                supervised.get(&key).is_some_and(|s| !s.may_restart(at))
+                supervised.get(&key).and_then(|s| s.hold(at))
             };
-            if held_down {
-                return o.fail(Refusal::refused(HELD_DOWN));
+            if let Some(hold) = hold {
+                return o.fail(Refusal::refused(held_down(hold)));
             }
             Some(at)
         };

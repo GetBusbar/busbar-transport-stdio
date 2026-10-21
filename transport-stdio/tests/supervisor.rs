@@ -4,9 +4,10 @@
 //! THE STDIO SUPERVISOR IS THE STDIO TRANSPORT'S (`BUSBAR-1.6.0.md` THE DESIGN §2, l.388), driven
 //! through the carrier's own table over a SCRIPTED host: its I/O (a spawn that answers or fails, a
 //! read that answers the program's end or PENDING while it runs) and its one clock (`clock.now`,
-//! monotonic, set by the test). The policy is 1.5.5's crash-loop policy: a program that ends is
-//! held down under a backoff doubling from 100 ms, and five ends inside a minute stop its restarts
-//! until its member is declared anew. A dial the policy holds down is REFUSED.
+//! monotonic, set by the test). The figures are `predev`'s (the pre-fold stdio MCP client's restart
+//! policy; 1.5.5 spawned no program): a program that ends is held down under a backoff doubling
+//! from 100 ms, and five ends inside a minute stop its restarts until its member is declared anew.
+//! A dial the policy holds down is REFUSED, saying how many ends it counted and how long it holds.
 //!
 //! The policy is kept per SUPERVISION KEY (`DialIn::supervision_key`), the member identity the host
 //! mints, so:
@@ -249,6 +250,26 @@ impl Carrier {
         (r, co.conn)
     }
 
+    /// Dial the member `key` and answer the outcome and the text it carries.
+    fn dial_text(&self, key: u64) -> (Outcome, String) {
+        let mut dest: Destination = z();
+        dest.kind = DEST_PROGRAM;
+        dest.program = s("/usr/bin/server");
+        let mut di: DialIn = z();
+        di.dest = &dest;
+        di.supervision_key = key;
+        let mut co: ConnOut = z();
+        let r = call(ops().dial, self.inst, &mut di, &mut co, slot::DIAL);
+        let e = co.head.error;
+        let text = if e.len == 0 {
+            String::new()
+        } else {
+            // SAFETY: the carrier's string, live for the call.
+            String::from_utf8(unsafe { std::slice::from_raw_parts(e.ptr, e.len) }.to_vec()).unwrap()
+        };
+        (r, text)
+    }
+
     /// Read `conn` once: with the script's `ended`, the program's end (a clean `len` `0`).
     fn read(&self, conn: u64) -> Outcome {
         let mut buf = [0_u8; 64];
@@ -449,5 +470,33 @@ fn an_end_met_without_a_clock_is_counted_once_the_clock_answers() {
         c.dial(60, "a").0,
         Outcome::Refused,
         "the end was counted at the shut"
+    );
+}
+
+/// THE HELD-DOWN REFUSAL SAYS WHAT HOLDS IT: one end answers the backoff it waits out, five answer
+/// the trip, each counting the ends. RED: every hold said the program "keeps ending", even after a
+/// single end.
+#[test]
+fn the_held_down_refusal_counts_the_ends_and_names_the_hold() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    c.run_to_end(70, "a");
+    advance(40 * MS);
+    assert_eq!(
+        c.dial_text(70),
+        (
+            Outcome::Refused,
+            "dial: the program ended once within a minute; the stdio supervisor holds its \
+             restart for another 60 ms"
+                .to_owned()
+        )
+    );
+    c.trip(71, "a");
+    let (r, why) = c.dial_text(71);
+    assert_eq!(r, Outcome::Refused);
+    assert_eq!(
+        why,
+        "dial: the program ended 5 times within a minute; the stdio supervisor holds its \
+         restarts down until the member is declared anew"
     );
 }

@@ -3,7 +3,7 @@
 
 //! The `stdio` carrier, driven through its own table the way the host's connector drives it, over a
 //! SCRIPTED host I/O table (`abi::host::io`): one frame per line in (a line split across reads, a
-//! blank line, the final unterminated line, the line ceiling), one line per frame out (gathered to
+//! blank line, an output that ends mid-line, the line ceiling), one line per frame out (gathered to
 //! its end, refused when it cannot be one line), the spawn of exactly the program it is lent, and
 //! every op of a role it does not play refused. An integration test, so the crate itself keeps
 //! `#![deny(unsafe_code)]`: driving a raw table is the host's side. The real host's I/O is driven by
@@ -37,6 +37,7 @@ const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
 const NOT_ONE_LINE: &str =
     "a message holding a newline, or ending in a carriage return, is not one line";
+const MID_LINE: &str = "the program closed its stdout mid-message; a truncated line is not a frame";
 
 fn z<T>() -> T {
     // SAFETY: every `in`/`out` here is plain C data; all-zero is a valid value of each.
@@ -357,7 +358,7 @@ fn each_line_is_one_frame_whatever_the_reads_cut() {
         Some(b"{\"a\":".to_vec()),
         None,
         Some(b"1}\r\n\nsecond".to_vec()),
-        Some(b" line\nlast".to_vec()),
+        Some(b" line\n".to_vec()),
         Some(Vec::new()),
     ]);
     // Half a line, then nothing ready: PENDING, nothing moved.
@@ -380,14 +381,38 @@ fn each_line_is_one_frame_whatever_the_reads_cut() {
         h.read(64),
         (Outcome::Ready, b"nd line".to_vec(), true, String::new())
     );
-    // The final unterminated line is a frame at the end, then the clean end.
-    assert_eq!(
-        h.read(64),
-        (Outcome::Ready, b"last".to_vec(), true, String::new())
-    );
+    // An output that ends on a line boundary answers the clean end.
     assert_eq!(
         h.read(64),
         (Outcome::Ready, Vec::new(), false, String::new())
+    );
+}
+
+/// A PROGRAM THAT DIES PART WAY THROUGH A LINE wrote no message: the read FAILS, naming the end
+/// mid-message, and the cut-off bytes are never answered as a frame (`predev`'s stdio MCP client,
+/// the MCP path's baseline, refused a truncated message the same way). RED: the unterminated rest
+/// was answered as a whole frame carrying `READ_END_OF_FRAME`.
+#[test]
+fn a_program_that_ends_mid_line_fails_the_read_and_answers_no_frame() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(vec![
+        Some(b"{\"id\":1}\n{\"id\":2,\"res".to_vec()),
+        Some(Vec::new()),
+    ]);
+    assert_eq!(
+        h.read(64),
+        (Outcome::Ready, b"{\"id\":1}".to_vec(), true, String::new()),
+        "the whole line before it is a frame"
+    );
+    assert_eq!(
+        h.read(64),
+        (Outcome::Failed, Vec::new(), false, MID_LINE.to_owned()),
+        "the cut-off line is a failed read, not a frame"
+    );
+    assert_eq!(
+        h.read(64),
+        (Outcome::Failed, Vec::new(), false, MID_LINE.to_owned()),
+        "and stays one"
     );
 }
 

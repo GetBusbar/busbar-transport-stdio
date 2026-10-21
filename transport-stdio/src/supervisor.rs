@@ -2,8 +2,10 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE STDIO SUPERVISOR (`BUSBAR-1.6.0.md` THE DESIGN §2, l.388: "the stdio supervisor is the stdio
-//! transport's"): the restart policy of a program that keeps ending, 1.5.5's crash-loop policy as
-//! busbar's connector held it before it moved here. A circuit breaker, not a retry loop: each end is
+//! transport's"): the restart policy of a program that keeps ending, new in 1.6.0 (1.5.5 spawned no
+//! program). Its figures are `predev`'s, the baseline of the MCP path (THE DESIGN l.380): the
+//! pre-fold stdio MCP client's restart policy (a 100 ms backoff doubling to 30 s, five ends inside a
+//! minute tripping its breaker). A circuit breaker, not a retry loop: each end is
 //! timed on the host's one clock (monotonic, `clock.now`, THE DESIGN §1 and l.291); the next spawn
 //! waits a backoff doubling from [`BASE_BACKOFF_NS`] to [`MAX_BACKOFF_NS`], and [`CRASH_THRESHOLD`]
 //! ends inside [`CRASH_WINDOW_NS`] stop the restarts until the member is declared anew.
@@ -24,6 +26,23 @@ pub const MAX_BACKOFF_NS: u64 = 30_000 * MS;
 pub const CRASH_THRESHOLD: usize = 5;
 /// The window the ends are counted over.
 pub const CRASH_WINDOW_NS: u64 = 60_000 * MS;
+
+/// Why a member's program may not be spawned now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// Inside the backoff after `ends` ends in the window: `remaining_ns` until it may restart.
+    Backoff {
+        /// The ends counted inside the window.
+        ends: usize,
+        /// How long until the backoff passes.
+        remaining_ns: u64,
+    },
+    /// `ends` ends inside the window tripped it: no restart until the member is declared anew.
+    Tripped {
+        /// The ends counted inside the window when it tripped.
+        ends: usize,
+    },
+}
 
 /// THE RESTART POLICY of one member's program, on the host's monotonic clock.
 #[derive(Debug, Default)]
@@ -67,9 +86,22 @@ impl Supervisor {
                 .all(|t| now.saturating_sub(*t) > CRASH_WINDOW_NS)
     }
 
-    /// Whether the program may be spawned at `now`.
-    pub fn may_restart(&self, now: u64) -> bool {
-        !self.tripped && self.restart_at.is_none_or(|at| now >= at)
+    /// What holds the program down at `now`, if anything: the ends counted and how long.
+    pub fn hold(&self, now: u64) -> Option<Hold> {
+        if self.tripped {
+            return Some(Hold::Tripped {
+                ends: self.crashes.len(),
+            });
+        }
+        let at = self.restart_at.filter(|at| now < *at)?;
+        Some(Hold::Backoff {
+            ends: self
+                .crashes
+                .iter()
+                .filter(|t| now.saturating_sub(**t) <= CRASH_WINDOW_NS)
+                .count(),
+            remaining_ns: at - now,
+        })
     }
 }
 
