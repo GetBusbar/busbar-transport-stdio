@@ -26,8 +26,8 @@ use crate::claims::CLAIM_NAMES;
 pub use crate::meta::KEY;
 use crate::meta::TAIL;
 pub use crate::transport::{
-    Arrival, Carried, Dial, Flush, Read, Refused, Shut, Write, MAX_LINE_BYTES, NOT_ONE_LINE,
-    TOO_LONG,
+    Arrival, Carried, Dial, Flush, Read, Refused, Shut, Write, BODY_MAX_BYTES, FRAME_TOO_LONG,
+    MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, TOO_LONG,
 };
 
 /// The door's Statement: the `stdio` carrier.
