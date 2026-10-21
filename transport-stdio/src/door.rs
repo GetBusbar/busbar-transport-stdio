@@ -25,9 +25,7 @@ use busbar_contract::abi::transport::{
 use crate::claims::CLAIM_NAMES;
 pub use crate::meta::KEY;
 use crate::meta::TAIL;
-pub use crate::transport::{
-    Arrival, Carried, Dial, Flush, Read, Refused, Shut, Write,
-};
+pub use crate::transport::{Arrival, Carried, Dial, Flush, Read, Refused, Shut, Write};
 
 busbar_contract::statement_extensions!(
     /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
