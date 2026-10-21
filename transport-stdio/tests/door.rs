@@ -443,15 +443,13 @@ fn a_frame_goes_out_as_one_line_and_one_that_cannot_be_one_is_refused() {
     assert_eq!(h.write(b"1}", true).0, Outcome::Ready);
     assert_eq!(h.write(b"", true).0, Outcome::Ready);
     with(|sc| assert_eq!(sc.written, b"{\"id\":1}\n\n"));
-    // REFUSED, as a frame past the ceiling is: one outcome class for every frame that cannot be
-    // one line. RED (row 159, stdio NIT): this one FAILED while the ceiling's was REFUSED.
     assert_eq!(
         h.write(b"two\nlines", true),
-        (Outcome::Refused, NOT_ONE_LINE.to_owned())
+        (Outcome::Failed, NOT_ONE_LINE.to_owned())
     );
     assert_eq!(
         h.write(b"a return\r", true),
-        (Outcome::Refused, NOT_ONE_LINE.to_owned())
+        (Outcome::Failed, NOT_ONE_LINE.to_owned())
     );
     with(|sc| {
         assert_eq!(
@@ -554,10 +552,13 @@ fn a_line_of_a_hundred_kib_is_one_frame() {
 }
 
 /// A FRAME IS BOUNDED LIKE A LINE: the bytes gathered for one outbound frame stop at the line
-/// ceiling ([`MAX_LINE_BYTES`]), as an inbound line does; past it the write is REFUSED, not
-/// gathered without bound. RED (Q128 transport-stdio NIT): the gathered frame had no ceiling.
+/// ceiling ([`MAX_LINE_BYTES`]), as an inbound line does; past it the write FAILS, not gathered
+/// without bound. RED (Q128 transport-stdio NIT): the gathered frame had no ceiling. FAILED, as a
+/// frame that cannot be one line is: one outcome class for every frame the carrier will not carry,
+/// the class the contract's carrier conformance script states for it (`Want::Starts("Failed ")`).
+/// RED (row 159, stdio NIT): this one was REFUSED while the newline's FAILED.
 #[test]
-fn a_gathered_frame_past_the_line_ceiling_is_refused() {
+fn a_gathered_frame_past_the_line_ceiling_fails() {
     let _one = ONE.lock().unwrap();
     let h = Host::new(Vec::new());
     let chunk = vec![b'x'; 1024 * 1024];
@@ -568,11 +569,7 @@ fn a_gathered_frame_past_the_line_ceiling_is_refused() {
             break;
         }
     }
-    assert_eq!(
-        answered,
-        Outcome::Refused,
-        "a frame past the ceiling is refused"
-    );
+    assert_eq!(answered, Outcome::Failed, "a frame past the ceiling fails");
 }
 
 /// THE LINE CEILING IS THE OPERATOR'S REQUEST-BODY BOUND: the tail declares the one setting the
@@ -592,7 +589,7 @@ fn the_tail_declares_the_request_body_bound_it_reads() {
 }
 
 /// A deployment's request-body bound is the line ceiling both ways: a line or a frame of exactly
-/// the bound crosses, one byte more fails the read or is refused at the write. RED (row 159, stdio
+/// the bound crosses, one byte more fails the read or the write. RED (row 159, stdio
 /// MEDIUM M2): the ceiling was a fixed 32 MiB whatever the deployment set.
 #[test]
 fn the_line_ceiling_is_the_deployments_request_body_bound() {
@@ -612,7 +609,7 @@ fn the_line_ceiling_is_the_deployments_request_body_bound() {
     assert_eq!(h.write(&[b'c'; 64], true).0, Outcome::Ready);
     assert_eq!(
         h.write(&[b'd'; 65], true).0,
-        Outcome::Refused,
+        Outcome::Failed,
         "a frame one byte past the bound"
     );
     with(|sc| assert_eq!(sc.written.len(), 65, "only the frame inside the bound left"));
@@ -646,7 +643,7 @@ fn a_refresh_moves_the_line_ceiling() {
     assert_eq!(h.refresh(&body_max(64)), Outcome::Ready);
     assert_eq!(
         h.write(&[b'x'; 100], true).0,
-        Outcome::Refused,
+        Outcome::Failed,
         "the refreshed bound holds"
     );
 }
