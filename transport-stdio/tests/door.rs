@@ -3,7 +3,7 @@
 
 //! The `stdio` carrier, driven through its own table the way the host's connector drives it, over a
 //! SCRIPTED host I/O table (`abi::host::io`): one frame per line in (a line split across reads, a
-//! blank line, the final unterminated line, the line ceiling), one line per frame out (gathered to
+//! blank line, an output that ends mid-line, the line ceiling), one line per frame out (gathered to
 //! its end, refused when it cannot be one line), the spawn of exactly the program it is lent, and
 //! every op of a role it does not play refused. An integration test, so the crate itself keeps
 //! `#![deny(unsafe_code)]`: driving a raw table is the host's side. The real host's I/O is driven by
@@ -33,7 +33,15 @@ use busbar_contract::abi::transport::{
     TransportTail, WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME, ROLE_CARRIER,
     SETTING_COUNT, WRITE_END_OF_FRAME,
 };
-use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, NOT_ONE_LINE, STATEMENT, TOO_LONG};
+use busbar_transport_stdio::door;
+
+// The carrier's published words, pinned here as the contract a host sees (the crate states them,
+// it does not export them).
+const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
+const NOT_ONE_LINE: &str =
+    "a message holding a newline, or ending in a carriage return, is not one line";
+const MID_LINE: &str = "the program closed its stdout mid-message; a truncated line is not a frame";
 
 fn z<T>() -> T {
     // SAFETY: every `in`/`out` here is plain C data; all-zero is a valid value of each.
@@ -41,10 +49,8 @@ fn z<T>() -> T {
 }
 
 fn s(t: &str) -> AbiStr {
-    AbiStr {
-        ptr: t.as_ptr(),
-        len: t.len(),
-    }
+    // SAFETY: `t` is the test's own text, live for every call it is passed to.
+    unsafe { AbiStr::from_raw_parts(t.as_ptr(), t.len()) }
 }
 
 /// `json` as a settings blob (`None`: absent, as the host hands a door that declares none).
@@ -64,15 +70,17 @@ fn body_max(n: usize) -> String {
 }
 
 fn text(t: AbiStr) -> String {
-    if t.len == 0 {
+    if t.is_empty() {
         return String::new();
     }
     // SAFETY: the carrier's string, live for the call.
-    String::from_utf8(unsafe { std::slice::from_raw_parts(t.ptr, t.len) }.to_vec()).unwrap()
+    String::from_utf8(unsafe { t.bytes() }.to_vec()).unwrap()
 }
 
 fn ops() -> &'static Ops {
-    let d: *const Door = door();
+    // SAFETY: `door()` answers the `'static` door of this crate.
+    #[allow(unused_unsafe)]
+    let d: *const Door = unsafe { door() };
     // SAFETY: the door answers a `'static` door whose table is this kind's `Ops`.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -90,11 +98,15 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         let oh = std::ptr::from_mut(o).cast::<OutHead>();
         (*oh).size = size_of::<O>() as u32;
     }
-    (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    )
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    }
     .outcome()
 }
 
@@ -357,10 +369,12 @@ impl Host {
 
 #[test]
 fn the_tail_is_a_carrier_composing_over_nothing() {
-    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
-    let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
+    // SAFETY: the door's Statement is this crate's `'static` one, and its kind tail a `'static`
+    // `TransportTail`.
+    let statement = unsafe { &*(*door()).statement };
+    let tail = unsafe { &*statement.kind_tail().cast::<TransportTail>() };
     assert_eq!(tail.role, ROLE_CARRIER);
-    assert_eq!(tail.composes_over_len, 0);
+    assert_eq!(tail.composes_over_len(), 0);
     assert_eq!(check_tail(tail), Ok(()));
 }
 
@@ -383,7 +397,7 @@ fn each_line_is_one_frame_whatever_the_reads_cut() {
         Some(b"{\"a\":".to_vec()),
         None,
         Some(b"1}\r\n\nsecond".to_vec()),
-        Some(b" line\nlast".to_vec()),
+        Some(b" line\n".to_vec()),
         Some(Vec::new()),
     ]);
     // Half a line, then nothing ready: PENDING, nothing moved.
@@ -406,14 +420,38 @@ fn each_line_is_one_frame_whatever_the_reads_cut() {
         h.read(64),
         (Outcome::Ready, b"nd line".to_vec(), true, String::new())
     );
-    // The final unterminated line is a frame at the end, then the clean end.
-    assert_eq!(
-        h.read(64),
-        (Outcome::Ready, b"last".to_vec(), true, String::new())
-    );
+    // An output that ends on a line boundary answers the clean end.
     assert_eq!(
         h.read(64),
         (Outcome::Ready, Vec::new(), false, String::new())
+    );
+}
+
+/// A PROGRAM THAT DIES PART WAY THROUGH A LINE wrote no message: the read FAILS, naming the end
+/// mid-message, and the cut-off bytes are never answered as a frame (`predev`'s stdio MCP client,
+/// the MCP path's baseline, refused a truncated message the same way). RED: the unterminated rest
+/// was answered as a whole frame carrying `READ_END_OF_FRAME`.
+#[test]
+fn a_program_that_ends_mid_line_fails_the_read_and_answers_no_frame() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(vec![
+        Some(b"{\"id\":1}\n{\"id\":2,\"res".to_vec()),
+        Some(Vec::new()),
+    ]);
+    assert_eq!(
+        h.read(64),
+        (Outcome::Ready, b"{\"id\":1}".to_vec(), true, String::new()),
+        "the whole line before it is a frame"
+    );
+    assert_eq!(
+        h.read(64),
+        (Outcome::Failed, Vec::new(), false, MID_LINE.to_owned()),
+        "the cut-off line is a failed read, not a frame"
+    );
+    assert_eq!(
+        h.read(64),
+        (Outcome::Failed, Vec::new(), false, MID_LINE.to_owned()),
+        "and stays one"
     );
 }
 
@@ -577,8 +615,9 @@ fn a_gathered_frame_past_the_line_ceiling_fails() {
 /// default is the default ceiling. RED (row 159, stdio MEDIUM M2): the carrier read no setting.
 #[test]
 fn the_tail_declares_the_request_body_bound_it_reads() {
-    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
-    let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
+    // SAFETY: `door` answers the `'static` door of this crate, whose Statement's kind tail is its
+    // `'static` `TransportTail`.
+    let tail = unsafe { &*(*(*door()).statement).kind_tail.cast::<TransportTail>() };
     assert_eq!(tail.settings_len, 1, "one setting declared");
     // SAFETY: the tail's own `'static` list, `settings_len` long.
     let decl = unsafe { &*tail.settings };

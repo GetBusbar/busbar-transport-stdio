@@ -4,10 +4,12 @@
 //! THE STDIO SUPERVISOR IS THE STDIO TRANSPORT'S (`BUSBAR-1.6.0.md` THE DESIGN §2, l.388), driven
 //! through the carrier's own table over a SCRIPTED host: its I/O (a spawn that answers or fails, a
 //! read that answers the program's end or PENDING while it runs) and its one clock (`clock.now`,
-//! monotonic, set by the test). The policy is predev's crash-loop policy (the connector's
-//! `program.rs`, the MCP-COMPAT baseline): a program that ends is held down under a backoff
-//! doubling from 100 ms, and five ends inside a minute stop its restarts until its member is
-//! declared anew. A dial the policy holds down is REFUSED.
+//! monotonic, set by the test). The figures are `predev`'s (the pre-fold stdio MCP client's restart
+//! policy; 1.5.5 spawned no program): a program that ends is held down under a backoff doubling
+//! from 100 ms, and five ends inside a minute stop its restarts, never on a timeout, until the
+//! member's supervision key changes (`predev`'s stdio client, busbar `732ba319c0`,
+//! stdio.rs:1013-1027, reset a child only when its own `command:` changed).
+//! A dial the policy holds down is REFUSED, saying how many ends it counted and how long it holds.
 //!
 //! The policy is kept per SUPERVISION KEY (`DialIn::supervision_key`), the member identity the host
 //! mints, so:
@@ -31,12 +33,20 @@ use busbar_contract::abi::mechanism::call::{
     AbiStr, Field, InHead, Op, OutHead, Outcome, RawOutcome,
 };
 use busbar_contract::abi::mechanism::door::Door;
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut, RefreshIn};
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::{
     slot, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, DEST_PROGRAM,
 };
-use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, TOO_LONG};
+use busbar_transport_stdio::door;
+
+/// The line ceiling when the host hands none: the host's default request-body bound (32 MiB), stated
+/// as a literal because the crate's only public item is `door`; the crate holds its own constant
+/// equal to this number against the default it declares.
+const MAX_LINE_BYTES: usize = 33_554_432;
+
+/// Why a read fails when a program's line runs past the ceiling.
+const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
 
 const MS: u64 = 1_000_000;
 
@@ -46,14 +56,14 @@ fn z<T>() -> T {
 }
 
 fn s(t: &str) -> AbiStr {
-    AbiStr {
-        ptr: t.as_ptr(),
-        len: t.len(),
-    }
+    // SAFETY: `t` is the test's own text, live for every call it is passed to.
+    unsafe { AbiStr::from_raw_parts(t.as_ptr(), t.len()) }
 }
 
 fn ops() -> &'static Ops {
-    let d: *const Door = door();
+    // SAFETY: `door()` answers the `'static` door of this crate.
+    #[allow(unused_unsafe)]
+    let d: *const Door = unsafe { door() };
     // SAFETY: the door answers a `'static` door whose table is this kind's `Ops`.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -71,11 +81,15 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         let oh = std::ptr::from_mut(o).cast::<OutHead>();
         (*oh).size = size_of::<O>() as u32;
     }
-    (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    )
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    }
     .outcome()
 }
 
@@ -262,6 +276,26 @@ impl Carrier {
         (r, co.conn)
     }
 
+    /// Dial the member `key` and answer the outcome and the text it carries.
+    fn dial_text(&self, key: u64) -> (Outcome, String) {
+        let mut dest: Destination = z();
+        dest.kind = DEST_PROGRAM;
+        dest.program = s("/usr/bin/server");
+        let mut di: DialIn = z();
+        di.dest = &dest;
+        di.supervision_key = key;
+        let mut co: ConnOut = z();
+        let r = call(ops().dial, self.inst, &mut di, &mut co, slot::DIAL);
+        let e = co.head.error;
+        let text = if e.is_empty() {
+            String::new()
+        } else {
+            // SAFETY: the carrier's string, live for the call.
+            String::from_utf8(unsafe { e.bytes() }.to_vec()).unwrap()
+        };
+        (r, text)
+    }
+
     /// Read `conn` once: with the script's `ended`, the program's end (a clean `len` `0`).
     fn read(&self, conn: u64) -> Outcome {
         self.read_why(conn).0
@@ -284,6 +318,17 @@ impl Carrier {
             String::from_utf8_lossy(b).into_owned()
         };
         (r, why)
+    }
+
+    /// A config apply: the instance's `refresh`.
+    fn refresh(&self) {
+        let mut i: RefreshIn = z();
+        i.generation = 2;
+        let mut o: OutHead = z();
+        assert_eq!(
+            call(ops().head.refresh, self.inst, &mut i, &mut o, life::REFRESH),
+            Outcome::Ready
+        );
     }
 
     fn shut(&self, conn: u64) {
@@ -322,7 +367,8 @@ fn advance(ns: u64) {
 // ── the tests ────────────────────────────────────────────────────────────────────────────────────
 
 /// A program that ends is held down for 100 ms, doubling; the fifth end inside a minute stops its
-/// restarts for good (an hour later it is still refused).
+/// restarts with no timeout: dialled every 30 s for an hour, then silent for an hour, it is still
+/// refused. RED: a trip nobody dialled for a minute was dropped, and the next dial spawned.
 #[test]
 fn a_program_that_keeps_ending_is_held_down_then_stopped() {
     let _one = ONE.lock().unwrap();
@@ -347,12 +393,63 @@ fn a_program_that_keeps_ending_is_held_down_then_stopped() {
     c.run_to_end(1, "a");
     advance(800 * MS);
     c.run_to_end(1, "a");
+    for _ in 0..120 {
+        advance(30_000 * MS);
+        assert_eq!(
+            c.dial(1, "a").0,
+            Outcome::Refused,
+            "five ends in a minute: stopped while it keeps asking"
+        );
+    }
     advance(3_600_000 * MS);
     assert_eq!(
         c.dial(1, "a").0,
         Outcome::Refused,
-        "five ends in a minute: stopped"
+        "an hour of silence: still stopped"
     );
+}
+
+/// AN UNRELATED CONFIG APPLY KEEPS A TRIPPED MEMBER TRIPPED (`predev`'s stdio client, busbar
+/// `732ba319c0`, stdio.rs:1013-1027, reset a child only when its own `command:` changed, "so
+/// touching an unrelated key does not re-arm a fork bomb"): after the instance's `refresh` the
+/// member's key is unchanged and its next dial is still refused, no program spawned. RED: a
+/// refresh cleared every trip, so each config apply re-armed every crash-looping program.
+#[test]
+fn an_unrelated_config_apply_keeps_a_tripped_member_tripped() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    c.trip(80, "a");
+    assert_eq!(c.dial(80, "a").0, Outcome::Refused, "tripped");
+    let spawns = with(|sc| sc.spawns);
+    c.refresh();
+    c.refresh();
+    assert_eq!(
+        c.dial(80, "a").0,
+        Outcome::Refused,
+        "the config apply left its command alone: still tripped"
+    );
+    assert_eq!(with(|sc| sc.spawns), spawns, "no program is spawned");
+}
+
+/// GREEN TWIN: a changed `command:` resets the member. The host mints a new supervision key for
+/// the changed program, so its next dial spawns, while the old key's trip stands.
+#[test]
+fn a_changed_command_resets_the_member() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    c.trip(82, "a");
+    c.refresh();
+    assert_eq!(
+        c.dial(82, "a").0,
+        Outcome::Refused,
+        "tripped, and applied over"
+    );
+    let spawns = with(|sc| sc.spawns);
+    let (r, conn) = c.dial(83, "a");
+    assert_eq!(r, Outcome::Ready, "the changed command is a new key: fresh");
+    assert_eq!(with(|sc| sc.spawns), spawns + 1, "the program is spawned");
+    with(|sc| sc.ended = false);
+    c.shut(conn);
 }
 
 /// A spawn that fails is counted like any end.
@@ -475,6 +572,34 @@ fn an_end_met_without_a_clock_is_counted_once_the_clock_answers() {
         c.dial(60, "a").0,
         Outcome::Refused,
         "the end was counted at the shut"
+    );
+}
+
+/// THE HELD-DOWN REFUSAL SAYS WHAT HOLDS IT: one end answers the backoff it waits out, five answer
+/// the trip, each counting the ends. RED: every hold said the program "keeps ending", even after a
+/// single end.
+#[test]
+fn the_held_down_refusal_counts_the_ends_and_names_the_hold() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    c.run_to_end(70, "a");
+    advance(40 * MS);
+    assert_eq!(
+        c.dial_text(70),
+        (
+            Outcome::Refused,
+            "dial: the program ended once within a minute; the stdio supervisor holds its \
+             restart for another 60 ms"
+                .to_owned()
+        )
+    );
+    c.trip(71, "a");
+    let (r, why) = c.dial_text(71);
+    assert_eq!(r, Outcome::Refused);
+    assert_eq!(
+        why,
+        "dial: the stdio supervisor tripped when the program ended 5 times within a minute; it \
+         stays stopped until the member's command changes"
     );
 }
 

@@ -14,28 +14,49 @@
 //! The door wires the kind's own files together: the key and tail [`crate::meta`] declares, the
 //! claims [`crate::claims`] declares, and the carrier [`crate::transport`] runs.
 
-use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
+use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
 use busbar_contract::abi::sdk::Safe;
 use busbar_contract::abi::transport::{
-    AcceptIn, AcceptOut, AdoptIn, BeginIn, EmitIn, EncodeIn, FinishIn, FramerOut, FramingIn,
-    IngestIn, ListenIn, ListenOut, LocateIn, LocateOut, Ops, RefuseIn, TransportTail,
+    AcceptIn, AcceptOut, AdoptIn, AuthPoints, BeginIn, EmitIn, EncodeIn, FinishIn, FramerOut,
+    FramingIn, IngestIn, ListenIn, ListenOut, LocateIn, LocateOut, Ops, RefuseIn,
+    EXT_OFFERED_POINTS,
 };
 
 use crate::claims::CLAIM_NAMES;
 pub use crate::meta::KEY;
 use crate::meta::TAIL;
-pub use crate::transport::{
-    Arrival, Carried, Dial, Flush, Read, Refused, Shut, Write, BODY_MAX_BYTES, FRAME_TOO_LONG,
-    MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, TOO_LONG,
-};
+pub use crate::transport::{Arrival, Carried, Dial, Flush, Read, Refused, Shut, Write};
+
+/// THE AUTH POINTS THIS CARRIER CALLS (THE DESIGN §6, "Auth points and guest lists"): none. It
+/// has no head, so it calls no `Head` or `HeadBody`, and no auth call reaches a carrier at its
+/// spawn, so it calls no `Peer`. A transport that states no record is read as offering
+/// `{Head, HeadBody}` (`abi::transport::EXT_OFFERED_POINTS`), so the empty set is stated: a
+/// guest-list line whose auth needs a point is refused at the seal, never sealed and left uncalled.
+pub const OFFERED_POINTS: AuthPoints = AuthPoints::EMPTY;
+
+/// [`OFFERED_POINTS`] as its record's four little-endian bytes.
+const OFFERED_POINTS_RECORD: [u8; 4] = OFFERED_POINTS.0.to_le_bytes();
+
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246)
+    /// and the auth points it offers.
+    EXTENSIONS: [
+        (
+            busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+            include_bytes!("../declares.json")
+        ),
+        (EXT_OFFERED_POINTS, &OFFERED_POINTS_RECORD),
+    ]
+);
 
 /// The door's Statement: the `stdio` carrier.
-pub const STATEMENT: Statement = Statement {
-    kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
-    claims: CLAIM_NAMES.as_ptr(),
-    claims_len: CLAIM_NAMES.len(),
-    ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+pub const STATEMENT: Statement = {
+    let mut s = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+        .with_kind_tail(&TAIL)
+        .with_claims(CLAIM_NAMES);
+    s.extensions = EXTENSIONS;
+    s
 };
 
 busbar_contract::plugin_door! {
