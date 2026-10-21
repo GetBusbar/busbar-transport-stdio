@@ -42,7 +42,7 @@ fn s(t: &str) -> AbiStr {
 }
 
 fn text(t: AbiStr) -> String {
-    if t.len() == 0 {
+    if t.is_empty() {
         return String::new();
     }
     // SAFETY: the carrier's string, live for the call.
