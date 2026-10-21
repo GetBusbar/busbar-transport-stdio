@@ -14,15 +14,14 @@ pub(crate) const CLAIM_NAMES: &[AbiStr] = &[abi_str(crate::meta::KEY)];
 
 /// The claim's row: no selector forms (a stdio channel has no surface to select on), a session
 /// whose first unit opens on its first line.
-pub(crate) const CLAIMS: &[Claim] = &[Claim {
-    selector_forms: abi_str(""),
-    egress_selector_forms: abi_str(""),
-    facts: std::ptr::null(),
-    facts_len: 0,
-    status_namespace: crate::meta::NONE,
-    session: 1,
-    session_bound: 1,
-    unit0_trigger: UNIT0_FIRST_LINE,
-    status_at: 0,
-    _reserved: 0,
+pub(crate) const CLAIMS: &[Claim] = &[{
+    let mut c = Claim::EMPTY;
+    c.selector_forms = abi_str("");
+    c.egress_selector_forms = abi_str("");
+    c.status_namespace = crate::meta::NONE;
+    c.session = 1;
+    c.session_bound = 1;
+    c.unit0_trigger = UNIT0_FIRST_LINE;
+    c.status_at = 0;
+    c
 }];

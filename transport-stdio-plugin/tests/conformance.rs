@@ -12,7 +12,7 @@
 //! `plugin-ci.yml` runs it under `--release`.
 
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_stdio::door::door,
+    door: busbar_transport_stdio::door::MACRO_DOOR,
     cdylib: "busbar_transport_stdio_plugin",
     inputs: include_str!("conformance.json"),
 }

@@ -14,12 +14,12 @@
 //! The door wires the kind's own files together: the key and tail [`crate::meta`] declares, the
 //! claims [`crate::claims`] declares, and the carrier [`crate::transport`] runs.
 
-use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
+use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
 use busbar_contract::abi::sdk::Safe;
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, BeginIn, EmitIn, EncodeIn, FinishIn, FramerOut, FramingIn,
-    IngestIn, ListenIn, ListenOut, LocateIn, LocateOut, Ops, RefuseIn, TransportTail,
+    IngestIn, ListenIn, ListenOut, LocateIn, LocateOut, Ops, RefuseIn,
 };
 
 use crate::claims::CLAIM_NAMES;
@@ -31,12 +31,9 @@ pub use crate::transport::{
 };
 
 /// The door's Statement: the `stdio` carrier.
-pub const STATEMENT: Statement = Statement {
-    kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
-    claims: CLAIM_NAMES.as_ptr(),
-    claims_len: CLAIM_NAMES.len(),
-    ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
-};
+pub const STATEMENT: Statement = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+    .with_kind_tail(&TAIL)
+    .with_claims(CLAIM_NAMES);
 
 busbar_contract::plugin_door! {
     ops: Ops,
