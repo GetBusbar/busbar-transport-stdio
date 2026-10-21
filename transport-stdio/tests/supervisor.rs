@@ -33,7 +33,7 @@ use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::{
     slot, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, DEST_PROGRAM,
 };
-use busbar_transport_stdio::door::door;
+use busbar_transport_stdio::door;
 
 const MS: u64 = 1_000_000;
 

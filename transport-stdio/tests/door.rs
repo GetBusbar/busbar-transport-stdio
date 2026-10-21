@@ -29,7 +29,14 @@ use busbar_contract::abi::transport::{
     TransportTail, WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME, ROLE_CARRIER,
     WRITE_END_OF_FRAME,
 };
-use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, NOT_ONE_LINE, STATEMENT, TOO_LONG};
+use busbar_transport_stdio::door;
+
+// The carrier's published words, pinned here as the contract a host sees (the crate states them,
+// it does not export them).
+const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
+const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
+const NOT_ONE_LINE: &str =
+    "a message holding a newline, or ending in a carriage return, is not one line";
 
 fn z<T>() -> T {
     // SAFETY: every `in`/`out` here is plain C data; all-zero is a valid value of each.
@@ -322,8 +329,10 @@ impl Host {
 
 #[test]
 fn the_tail_is_a_carrier_composing_over_nothing() {
-    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
-    let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
+    // SAFETY: the door's Statement is this crate's `'static` one, and its kind tail a `'static`
+    // `TransportTail`.
+    let statement = unsafe { &*door().statement };
+    let tail = unsafe { &*statement.kind_tail.cast::<TransportTail>() };
     assert_eq!(tail.role, ROLE_CARRIER);
     assert_eq!(tail.composes_over_len, 0);
     assert_eq!(check_tail(tail), Ok(()));

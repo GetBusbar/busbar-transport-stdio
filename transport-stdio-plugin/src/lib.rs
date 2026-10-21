@@ -3,7 +3,7 @@
 
 //! The **`stdio` transport as a droppable busbar plugin**: the `cdylib` a signed tarball of the wire
 //! carries (`kind: transport`, key `stdio`). The logic crate is re-exported whole, and its door
-//! (`busbar_transport_stdio::door::door`) is exported as this image's ONE symbol,
+//! (`busbar_transport_stdio::door`) is exported as this image's ONE symbol,
 //! `busbar_plugin_door` (`export_door!`, THE DESIGN §11.4), so the library carries exactly the door
 //! a busbar build links.
 //!
@@ -12,10 +12,8 @@
 
 #![deny(unsafe_code)]
 
-pub use busbar_transport_stdio::*;
-
 /// The exported door: the macro's `#[no_mangle]` symbol is the one exemption.
 #[allow(unsafe_code)]
 mod exported {
-    busbar_contract::export_door!(busbar_transport_stdio::door::door);
+    busbar_contract::export_door!(busbar_transport_stdio::door);
 }
