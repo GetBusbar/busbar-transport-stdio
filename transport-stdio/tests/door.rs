@@ -331,7 +331,7 @@ impl Host {
 fn the_tail_is_a_carrier_composing_over_nothing() {
     // SAFETY: the door's Statement is this crate's `'static` one, and its kind tail a `'static`
     // `TransportTail`.
-    let statement = unsafe { &*door().statement };
+    let statement = unsafe { &*(*door()).statement };
     let tail = unsafe { &*statement.kind_tail.cast::<TransportTail>() };
     assert_eq!(tail.role, ROLE_CARRIER);
     assert_eq!(tail.composes_over_len, 0);
