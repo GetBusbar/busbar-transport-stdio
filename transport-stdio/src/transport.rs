@@ -370,7 +370,16 @@ impl Conn {
     fn drain(&mut self, io: &mut Io<'_>) -> Poll<Result<(), IoFailure>> {
         while self.sent < self.outbound.len() {
             match io.write(self.io, &self.outbound[self.sent..]) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // The bytes the pipe took leave the queue once they are half of it, so the
+                    // queue holds at most twice what is owed, and moving the rest costs no more
+                    // than the bytes already sent.
+                    if self.sent >= self.outbound.len() / 2 {
+                        self.outbound.drain(..self.sent);
+                        self.sent = 0;
+                    }
+                    return Poll::Pending;
+                }
                 Poll::Ready(Ok(n)) => self.sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
