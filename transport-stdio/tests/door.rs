@@ -29,9 +29,11 @@ use busbar_contract::abi::mechanism::lifecycle::{
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::check::check_tail;
 use busbar_contract::abi::transport::{
-    slot, ArrivalIn, ArrivalOut, ConnIn, ConnOut, Destination, DialIn, IoOut, ListenIn, ListenOut,
-    Ops, ReadIn, ShutIn, TransportTail, WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME,
-    ROLE_CARRIER, SETTING_COUNT, WRITE_END_OF_FRAME,
+    slot, AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut,
+    Destination, DialIn, EmitIn, EncodeIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut,
+    ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, TransportTail,
+    WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME, ROLE_CARRIER, SETTING_COUNT,
+    WRITE_END_OF_FRAME,
 };
 use busbar_transport_stdio::door::{
     door, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, STATEMENT, TOO_LONG,
@@ -712,13 +714,13 @@ fn a_read_or_write_on_a_shut_connection_fails() {
     let (r, _, _, why) = h.read(64);
     assert_eq!(
         (r, why.as_str()),
-        (Outcome::Failed, "no such connection"),
+        (Outcome::Failed, "read: no such connection"),
         "read"
     );
     let (r, why) = h.write(b"x", true);
     assert_eq!(
         (r, why.as_str()),
-        (Outcome::Failed, "no such connection"),
+        (Outcome::Failed, "write: no such connection"),
         "write"
     );
 }
@@ -813,4 +815,158 @@ fn a_program_that_reads_slower_than_frames_arrive_holds_a_bounded_queue() {
             "the bytes the program got are the frames"
         )
     });
+}
+
+// ── sibling canon: settings, role stubs, prefixes, close ────────────────────────────────────────
+
+fn validate_text(json: &str) -> (Outcome, String) {
+    let mut reason = [0_u8; 256];
+    let mut i: ValidateIn = z();
+    i.err_buf = reason.as_mut_ptr();
+    i.err_cap = reason.len();
+    i.settings = settings(Some(json));
+    let mut o: OutHead = z();
+    let r = call(
+        ops().head.validate,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::VALIDATE,
+    );
+    (r, text(o.error))
+}
+
+#[test]
+fn settings_refuse_undeclared_keys_zero_and_bad_counts_with_the_canonical_texts() {
+    assert_eq!(
+        validate_text("{\"nope\":1}"),
+        (
+            Outcome::Failed,
+            "settings: nope is not a setting this transport reads".to_owned()
+        )
+    );
+    let above_0 = "settings: limits.request_body_max_bytes must be a count of bytes above 0";
+    for bound in ["0", "\"big\"", "-1", "1.5", "null"] {
+        assert_eq!(
+            validate_text(&format!("{{\"limits.request_body_max_bytes\":{bound}}}")),
+            (Outcome::Failed, above_0.to_owned()),
+            "{bound}"
+        );
+    }
+    assert_eq!(validate_text("[]").1, "settings: must be a JSON object");
+    assert_eq!(validate_text("{}").0, Outcome::Ready);
+    assert_eq!(validate_text(&body_max(5)).0, Outcome::Ready);
+}
+
+#[test]
+fn open_and_refresh_refuse_undeclared_keys() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    assert_eq!(h.refresh("{\"nope\":true}"), Outcome::Failed);
+    assert_eq!(
+        h.refresh("{\"limits.request_body_max_bytes\":0}"),
+        Outcome::Failed
+    );
+    let mut i: OpenIn = z();
+    i.settings = settings(Some("{\"nope\":1}"));
+    let mut o: OpenOut = z();
+    assert_eq!(
+        call(
+            ops().head.open,
+            std::ptr::null_mut(),
+            &mut i,
+            &mut o,
+            life::OPEN
+        ),
+        Outcome::Failed
+    );
+}
+
+/// Each role stub answers REFUSED with its own op's text.
+#[test]
+fn every_role_stub_is_refused_with_its_own_op_text() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    macro_rules! stub {
+        ($field:ident, $idx:ident, $in:ty, $out:ty, $name:literal) => {{
+            let mut i: $in = z();
+            let mut o: $out = z();
+            let r = call(ops().$field, h.inst, &mut i, &mut o, slot::$idx);
+            assert_eq!(
+                (r, text(o.head.error)),
+                (
+                    Outcome::Refused,
+                    concat!($name, ": the stdio carrier does not serve this op").to_owned()
+                ),
+                $name
+            );
+        }};
+    }
+    stub!(listen, LISTEN, ListenIn, ListenOut, "listen");
+    stub!(accept, ACCEPT, AcceptIn, AcceptOut, "accept");
+    stub!(locate, LOCATE, LocateIn, LocateOut, "locate");
+    stub!(begin, BEGIN, BeginIn, FramerOut, "begin");
+    stub!(ingest, INGEST, IngestIn, FramerOut, "ingest");
+    stub!(emit, EMIT, EmitIn, FramerOut, "emit");
+    stub!(encode, ENCODE, EncodeIn, FramerOut, "encode");
+    stub!(refuse, REFUSE, RefuseIn, FramerOut, "refuse");
+    stub!(finish, FINISH, FinishIn, FramerOut, "finish");
+    stub!(detach, DETACH, FramingIn, FramerOut, "detach");
+    stub!(adopt, ADOPT, AdoptIn, FramerOut, "adopt");
+    stub!(timer, TIMER, FramingIn, FramerOut, "timer");
+}
+
+#[test]
+fn an_op_with_no_open_instance_fails_with_its_prefix() {
+    let mut i: ConnIn = z();
+    let mut o: OutHead = z();
+    let r = call(
+        ops().flush,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        slot::FLUSH,
+    );
+    assert_eq!(
+        (r, text(o.error)),
+        (Outcome::Failed, "flush: no open instance".to_owned())
+    );
+}
+
+#[test]
+fn line_failure_texts_carry_the_op_prefix() {
+    assert!(TOO_LONG.starts_with("read: "), "{TOO_LONG}");
+    assert!(busbar_transport_stdio::door::FRAME_TOO_LONG.starts_with("write: "));
+    assert!(NOT_ONE_LINE.starts_with("write: "));
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    let mut i: ConnIn = z();
+    i.conn = h.conn + 99;
+    let mut o: OutHead = z();
+    assert_eq!(
+        call(ops().flush, h.inst, &mut i, &mut o, slot::FLUSH),
+        Outcome::Failed
+    );
+    assert_eq!(text(o.error), "flush: no such connection");
+}
+
+/// Instance close closes every connection handle still held (the program is killed with it).
+#[test]
+fn instance_close_closes_every_held_connection() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    with(|sc| assert!(sc.closed.is_empty()));
+    let mut i: InHead = z();
+    let mut o: OutHead = z();
+    assert_eq!(
+        call(ops().head.close, h.inst, &mut i, &mut o, life::CLOSE),
+        Outcome::Ready
+    );
+    with(|sc| assert_eq!(sc.closed, [7], "the held program handle was closed"));
+}
+
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let declared = STATEMENT.extensions.len;
+    assert_ne!(declared, 0, "declares.json rides the Statement");
 }
