@@ -165,6 +165,11 @@ struct Script {
     written: Vec<u8>,
     /// Handles closed.
     closed: Vec<u64>,
+    /// `Some(k)`: the pipe TRICKLES, taking at most `k` bytes on one `io.write` and answering
+    /// PENDING on the next. `None`: it takes everything.
+    trickle: Option<usize>,
+    /// Whether the next trickling `io.write` answers PENDING.
+    pend_next: bool,
 }
 
 static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
@@ -213,8 +218,24 @@ extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
     let i = unsafe { input.cast::<IoWriteIn>().read() };
     // SAFETY: the carrier's bytes.
     let bytes = unsafe { std::slice::from_raw_parts(i.bytes, i.len) };
-    with(|sc| sc.written.extend_from_slice(bytes));
-    answer(out, Outcome::Ready, 0, bytes.len() as u64)
+    let taken = with(|sc| {
+        let Some(k) = sc.trickle else {
+            sc.written.extend_from_slice(bytes);
+            return Some(bytes.len());
+        };
+        sc.pend_next = !sc.pend_next;
+        if sc.pend_next {
+            let n = k.min(bytes.len());
+            sc.written.extend_from_slice(&bytes[..n]);
+            Some(n)
+        } else {
+            None
+        }
+    });
+    match taken {
+        Some(n) => answer(out, Outcome::Ready, 0, n as u64),
+        None => answer(out, Outcome::Pending, 0, 0),
+    }
 }
 
 extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
@@ -687,4 +708,57 @@ fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
         (Outcome::Ready, 64, false, ""),
         "a line at the ceiling is a frame"
     );
+}
+
+/// A SLOW READER'S QUEUE IS BOUNDED: a program that reads stdin slower than frames arrive leaves the
+/// pipe never fully drained when the next frame is written, yet the bytes the pipe took leave the
+/// queue, so it holds a working size (not every byte ever written) and the data path allocates
+/// nothing once the queue sits at its cap. Every byte still arrives, each frame as one line, in order.
+/// RED (codeaudit 0aa4f6d, stdio MEDIUM): the written prefix stayed queued until the pipe took
+/// everything, so a slow reader's queue grew by every byte written.
+#[test]
+fn a_program_that_reads_slower_than_frames_arrive_holds_a_bounded_queue() {
+    let _one = ONE.lock().unwrap();
+    const FRAME: usize = 1000;
+    const WARM: usize = 3000;
+    const WINDOW: usize = 6000;
+    let frames: Vec<Vec<u8>> = (0..WARM + WINDOW)
+        .map(|n| vec![b'a' + (n % 26) as u8; FRAME])
+        .collect();
+    let h = Host::new(Vec::new());
+    with(|sc| {
+        sc.written.reserve(2 * (WARM + WINDOW) * (FRAME + 1));
+        // Each write op takes less than the 1001 bytes a frame adds.
+        sc.trickle = Some(400);
+    });
+    // The host offers the frame again while the write answers PENDING.
+    let send = |frame: &[u8]| {
+        while h.write_frame(frame) == Outcome::Pending {}
+    };
+    for frame in &frames[..WARM] {
+        send(frame);
+    }
+    let ((), n) = allocations(|| {
+        for frame in &frames[WARM..] {
+            send(frame);
+        }
+    });
+    assert_eq!(n, 0, "writing to a slow reader allocated {n} times");
+
+    // The pipe speeds up: everything queued drains, and all of it is the frames, in order.
+    with(|sc| sc.trickle = None);
+    let mut i: ConnIn = z();
+    i.conn = h.conn;
+    let mut o: OutHead = z();
+    while call(ops().flush, h.inst, &mut i, &mut o, slot::FLUSH) == Outcome::Pending {}
+    let want: Vec<u8> = frames
+        .iter()
+        .flat_map(|f| f.iter().copied().chain(std::iter::once(b'\n')))
+        .collect();
+    with(|sc| {
+        assert!(
+            sc.written == want,
+            "the bytes the program got are the frames"
+        )
+    });
 }
