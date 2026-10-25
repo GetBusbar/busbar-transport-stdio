@@ -29,11 +29,13 @@ use busbar_contract::abi::mechanism::lifecycle::{
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::check::check_tail;
 use busbar_contract::abi::transport::{
-    slot, ConnIn, ConnOut, Destination, DialIn, IoOut, ListenIn, ListenOut, Ops, ReadIn, ShutIn,
-    TransportTail, WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME, ROLE_CARRIER,
-    SETTING_COUNT, WRITE_END_OF_FRAME,
+    slot, ArrivalIn, ArrivalOut, ConnIn, ConnOut, Destination, DialIn, IoOut, ListenIn, ListenOut,
+    Ops, ReadIn, ShutIn, TransportTail, WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME,
+    ROLE_CARRIER, SETTING_COUNT, WRITE_END_OF_FRAME,
 };
-use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, NOT_ONE_LINE, STATEMENT, TOO_LONG};
+use busbar_transport_stdio::door::{
+    door, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, STATEMENT, TOO_LONG,
+};
 
 fn z<T>() -> T {
     // SAFETY: every `in`/`out` here is plain C data; all-zero is a valid value of each.
@@ -165,6 +167,11 @@ struct Script {
     written: Vec<u8>,
     /// Handles closed.
     closed: Vec<u64>,
+    /// `Some(k)`: the pipe TRICKLES, taking at most `k` bytes on one `io.write` and answering
+    /// PENDING on the next. `None`: it takes everything.
+    trickle: Option<usize>,
+    /// Whether the next trickling `io.write` answers PENDING.
+    pend_next: bool,
 }
 
 static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
@@ -213,8 +220,24 @@ extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
     let i = unsafe { input.cast::<IoWriteIn>().read() };
     // SAFETY: the carrier's bytes.
     let bytes = unsafe { std::slice::from_raw_parts(i.bytes, i.len) };
-    with(|sc| sc.written.extend_from_slice(bytes));
-    answer(out, Outcome::Ready, 0, bytes.len() as u64)
+    let taken = with(|sc| {
+        let Some(k) = sc.trickle else {
+            sc.written.extend_from_slice(bytes);
+            return Some(bytes.len());
+        };
+        sc.pend_next = !sc.pend_next;
+        if sc.pend_next {
+            let n = k.min(bytes.len());
+            sc.written.extend_from_slice(&bytes[..n]);
+            Some(n)
+        } else {
+            None
+        }
+    });
+    match taken {
+        Some(n) => answer(out, Outcome::Ready, 0, n as u64),
+        None => answer(out, Outcome::Pending, 0, 0),
+    }
 }
 
 extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
@@ -648,24 +671,74 @@ fn a_refresh_moves_the_line_ceiling() {
     );
 }
 
-/// A bound that is no count of bytes is FAILED at `validate`, before any instance opens on it.
-/// RED (row 159, stdio MEDIUM M2): the carrier validated nothing.
+/// A bound that is no count of bytes is FAILED at `validate`, before any instance opens on it:
+/// a string, a negative number, a fraction and a null alike. RED (row 159, stdio MEDIUM M2): the
+/// carrier validated nothing.
 #[test]
 fn a_request_body_bound_that_is_no_count_fails_validation() {
-    let json = "{\"limits.request_body_max_bytes\":\"big\"}";
-    let mut i: ValidateIn = z();
-    i.settings = settings(Some(json));
+    for bound in ["\"big\"", "-1", "1.5", "null"] {
+        let json = format!("{{\"limits.request_body_max_bytes\":{bound}}}");
+        let mut i: ValidateIn = z();
+        i.settings = settings(Some(&json));
+        let mut o: OutHead = z();
+        assert_eq!(
+            call(
+                ops().head.validate,
+                std::ptr::null_mut(),
+                &mut i,
+                &mut o,
+                life::VALIDATE
+            ),
+            Outcome::Failed,
+            "{bound} is no count"
+        );
+        assert_eq!(text(o.error), NOT_A_COUNT, "{bound} is no count");
+    }
+}
+
+/// An op on a connection that is gone FAILS: after the shut, a read and a write find no such
+/// connection (not a clean end, not a taken frame).
+#[test]
+fn a_read_or_write_on_a_shut_connection_fails() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    let mut i: ShutIn = z();
+    i.conn = h.conn;
     let mut o: OutHead = z();
     assert_eq!(
-        call(
-            ops().head.validate,
-            std::ptr::null_mut(),
-            &mut i,
-            &mut o,
-            life::VALIDATE
-        ),
-        Outcome::Failed
+        call(ops().shut, h.inst, &mut i, &mut o, slot::SHUT),
+        Outcome::Ready
     );
+    let (r, _, _, why) = h.read(64);
+    assert_eq!(
+        (r, why.as_str()),
+        (Outcome::Failed, "no such connection"),
+        "read"
+    );
+    let (r, why) = h.write(b"x", true);
+    assert_eq!(
+        (r, why.as_str()),
+        (Outcome::Failed, "no such connection"),
+        "write"
+    );
+}
+
+/// `arrival` answers READY for a live connection and FAILS for one the carrier never made.
+#[test]
+fn arrival_answers_for_a_live_connection_only() {
+    let _one = ONE.lock().unwrap();
+    let h = Host::new(Vec::new());
+    let mut peer = [0_u8; 16];
+    let mut arrival = |conn: u64| {
+        let mut i: ArrivalIn = z();
+        i.conn = conn;
+        i.peer_buf = peer.as_mut_ptr();
+        i.peer_cap = peer.len();
+        let mut o: ArrivalOut = z();
+        call(ops().arrival, h.inst, &mut i, &mut o, slot::ARRIVAL)
+    };
+    assert_eq!(arrival(h.conn), Outcome::Ready, "a live connection");
+    assert_eq!(arrival(h.conn + 1000), Outcome::Failed, "an unknown one");
 }
 
 /// A line of exactly the ceiling ended by CRLF is one frame whichever read its CR and its LF
@@ -687,4 +760,57 @@ fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
         (Outcome::Ready, 64, false, ""),
         "a line at the ceiling is a frame"
     );
+}
+
+/// A SLOW READER'S QUEUE IS BOUNDED: a program that reads stdin slower than frames arrive leaves the
+/// pipe never fully drained when the next frame is written, yet the bytes the pipe took leave the
+/// queue, so it holds a working size (not every byte ever written) and the data path allocates
+/// nothing once the queue sits at its cap. Every byte still arrives, each frame as one line, in order.
+/// RED (codeaudit 0aa4f6d, stdio MEDIUM): the written prefix stayed queued until the pipe took
+/// everything, so a slow reader's queue grew by every byte written.
+#[test]
+fn a_program_that_reads_slower_than_frames_arrive_holds_a_bounded_queue() {
+    let _one = ONE.lock().unwrap();
+    const FRAME: usize = 1000;
+    const WARM: usize = 3000;
+    const WINDOW: usize = 6000;
+    let frames: Vec<Vec<u8>> = (0..WARM + WINDOW)
+        .map(|n| vec![b'a' + (n % 26) as u8; FRAME])
+        .collect();
+    let h = Host::new(Vec::new());
+    with(|sc| {
+        sc.written.reserve(2 * (WARM + WINDOW) * (FRAME + 1));
+        // Each write op takes less than the 1001 bytes a frame adds.
+        sc.trickle = Some(400);
+    });
+    // The host offers the frame again while the write answers PENDING.
+    let send = |frame: &[u8]| {
+        while h.write_frame(frame) == Outcome::Pending {}
+    };
+    for frame in &frames[..WARM] {
+        send(frame);
+    }
+    let ((), n) = allocations(|| {
+        for frame in &frames[WARM..] {
+            send(frame);
+        }
+    });
+    assert_eq!(n, 0, "writing to a slow reader allocated {n} times");
+
+    // The pipe speeds up: everything queued drains, and all of it is the frames, in order.
+    with(|sc| sc.trickle = None);
+    let mut i: ConnIn = z();
+    i.conn = h.conn;
+    let mut o: OutHead = z();
+    while call(ops().flush, h.inst, &mut i, &mut o, slot::FLUSH) == Outcome::Pending {}
+    let want: Vec<u8> = frames
+        .iter()
+        .flat_map(|f| f.iter().copied().chain(std::iter::once(b'\n')))
+        .collect();
+    with(|sc| {
+        assert!(
+            sc.written == want,
+            "the bytes the program got are the frames"
+        )
+    });
 }

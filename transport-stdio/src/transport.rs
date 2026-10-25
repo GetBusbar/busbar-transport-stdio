@@ -97,8 +97,10 @@ fn emptied(buf: &mut Vec<u8>) {
 /// Why a member's dial is refused while its program is held down.
 pub const HELD_DOWN: &str =
     "dial: the program keeps ending; its restarts are held down by the stdio supervisor";
-/// Why a member's dial fails with no host clock to supervise it by.
-pub const NO_CLOCK: &str = "dial: the host lent this carrier no clock to supervise a program by";
+/// Why a member's dial fails when the host's clock does not answer (none lent, or it failed): a
+/// member's program is never run unsupervised.
+pub const NO_CLOCK: &str =
+    "dial: the host's clock did not answer; a member's program is not run unsupervised";
 
 /// The most output a program that exited can have left unread: one full pipe. The host reads the
 /// program's pipe itself and holds none of it, and a pipe is 64 KiB unless the program resizes its
@@ -223,7 +225,7 @@ impl Carried {
     }
 
     /// The member `key`'s program ended at `now`: counted once per connection.
-    /// An end met while the host's clock does not answer stays uncounted, so a later read or the
+    /// An end met while the host's clock does not answer stays uncounted, so the
     /// connection's shut counts it.
     fn ended(&self, c: &mut Conn, now: Option<u64>) {
         if c.key == 0 || c.counted {
@@ -357,12 +359,14 @@ impl Conn {
         }
     }
 
-    /// Room for the next pipe read: the answered bytes leave the front of `inbound`.
+    /// Room for the next pipe read: the answered bytes leave the front of `inbound`, and the
+    /// buffer gives back what a large line grew it past [`KEEP_BYTES`].
     fn compact(&mut self) {
         if self.head > 0 {
             self.inbound.drain(..self.head);
             self.scanned -= self.head.min(self.scanned);
             self.head = 0;
+            self.inbound.shrink_to(KEEP_BYTES);
         }
     }
 
@@ -370,7 +374,16 @@ impl Conn {
     fn drain(&mut self, io: &mut Io<'_>) -> Poll<Result<(), IoFailure>> {
         while self.sent < self.outbound.len() {
             match io.write(self.io, &self.outbound[self.sent..]) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // The bytes the pipe took leave the queue once they are half of it, so the
+                    // queue holds at most twice what is owed, and moving the rest costs no more
+                    // than the bytes already sent.
+                    if self.sent >= self.outbound.len() / 2 {
+                        self.outbound.drain(..self.sent);
+                        self.sent = 0;
+                    }
+                    return Poll::Pending;
+                }
                 Poll::Ready(Ok(n)) => self.sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
