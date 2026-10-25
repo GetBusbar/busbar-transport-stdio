@@ -245,6 +245,12 @@ impl Carrier {
     /// Dial `/usr/bin/server` for the member `key`, its environment `TOKEN=<token>`: the outcome
     /// and the connection.
     fn dial(&self, key: u64, token: &str) -> (Outcome, u64) {
+        let (r, conn, _) = self.dial_why(key, token);
+        (r, conn)
+    }
+
+    /// As [`Carrier::dial`], and why when it fails.
+    fn dial_why(&self, key: u64, token: &str) -> (Outcome, u64, String) {
         let env = [Field {
             name: s("TOKEN"),
             value: s(token),
@@ -259,7 +265,14 @@ impl Carrier {
         di.supervision_key = key;
         let mut co: ConnOut = z();
         let r = call(ops().dial, self.inst, &mut di, &mut co, slot::DIAL);
-        (r, co.conn)
+        let why = if co.head.error.len == 0 {
+            String::new()
+        } else {
+            // SAFETY: the carrier's string, live for the call.
+            let b = unsafe { std::slice::from_raw_parts(co.head.error.ptr, co.head.error.len) };
+            String::from_utf8_lossy(b).into_owned()
+        };
+        (r, co.conn, why)
     }
 
     /// Read `conn` once: with the script's `ended`, the program's end (a clean `len` `0`).
@@ -452,6 +465,23 @@ fn a_program_no_member_runs_is_not_supervised() {
     for _ in 0..8 {
         c.run_to_end(0, "a");
     }
+    assert_eq!(c.dial(0, "a").0, Outcome::Ready);
+}
+
+/// A member's program is never run unsupervised: with a clock that does not answer its dial fails
+/// without a spawn, and says the clock did not answer (it was lent). An unsupervised program
+/// (key `0`) needs no clock. RED (codeaudit 0aa4f6d, stdio LOW): the reason claimed the host lent
+/// no clock.
+#[test]
+fn a_member_is_not_run_when_the_clock_does_not_answer() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    with(|sc| sc.clock_fails = true);
+    let before = with(|sc| sc.spawns);
+    let (r, _, why) = c.dial_why(60, "a");
+    assert_eq!(r, Outcome::Failed);
+    assert_eq!(with(|sc| sc.spawns), before, "no program was spawned");
+    assert!(why.contains("did not answer"), "reason was: {why}");
     assert_eq!(c.dial(0, "a").0, Outcome::Ready);
 }
 
