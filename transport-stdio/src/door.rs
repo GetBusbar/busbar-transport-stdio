@@ -14,52 +14,72 @@
 //! The door wires the kind's own files together: the key and tail [`crate::meta`] declares, the
 //! claims [`crate::claims`] declares, and the carrier [`crate::transport`] runs.
 
-use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
+use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
-use busbar_contract::abi::sdk::Safe;
-use busbar_contract::abi::transport::{
-    AcceptIn, AcceptOut, AdoptIn, BeginIn, EmitIn, EncodeIn, FinishIn, FramerOut, FramingIn,
-    IngestIn, ListenIn, ListenOut, LocateIn, LocateOut, Ops, RefuseIn, TransportTail,
+use busbar_contract::abi::sdk::life::{
+    Cancel, Drive, Open, Refresh, Release, Retire, Tick, Validate,
 };
+use busbar_contract::abi::sdk::Safe;
+use busbar_contract::abi::transport::Ops;
 
 use crate::claims::CLAIM_NAMES;
 pub use crate::meta::KEY;
 use crate::meta::TAIL;
 pub use crate::transport::{
-    Arrival, Carried, Dial, Flush, Read, Refused, Shut, Write, BODY_MAX_BYTES, FRAME_TOO_LONG,
+    Accept, Adopt, Arrival, Begin, Carried, Close, Detach, Dial, Emit, Encode, Finish, Flush,
+    Ingest, Listen, Locate, Read, RefuseFrame, Shut, Timer, Write, BODY_MAX_BYTES, FRAME_TOO_LONG,
     MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, TOO_LONG,
 };
 
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../declares.json")
+    )]
+);
+
 /// The door's Statement: the `stdio` carrier.
-pub const STATEMENT: Statement = Statement {
-    kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
-    claims: CLAIM_NAMES.as_ptr(),
-    claims_len: CLAIM_NAMES.len(),
-    ..statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+pub const STATEMENT: Statement = {
+    let mut s = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
+        .with_kind_tail(&TAIL)
+        .with_claims(CLAIM_NAMES);
+    s.extensions = EXTENSIONS;
+    s
 };
 
 busbar_contract::plugin_door! {
     ops: Ops,
     statement: STATEMENT,
-    lifecycle: life(Carried),
+    lifecycle: {
+        validate: Safe<Validate<Carried>>,
+        open: Safe<Open<Carried>>,
+        refresh: Safe<Refresh<Carried>>,
+        retire: Safe<Retire<Carried>>,
+        tick: Safe<Tick<Carried>>,
+        drive: Safe<Drive<Carried>>,
+        cancel: Safe<Cancel<Carried>>,
+        release: Safe<Release<Carried>>,
+        close: Safe<Close>,
+    },
     kind_ops: {
-        listen: Safe<Refused<ListenIn, ListenOut>>,
-        accept: Safe<Refused<AcceptIn, AcceptOut>>,
+        listen: Safe<Listen>,
+        accept: Safe<Accept>,
         dial: Safe<Dial>,
         read: Safe<Read>,
         write: Safe<Write>,
         flush: Safe<Flush>,
         shut: Safe<Shut>,
         arrival: Safe<Arrival>,
-        locate: Safe<Refused<LocateIn, LocateOut>>,
-        begin: Safe<Refused<BeginIn, FramerOut>>,
-        ingest: Safe<Refused<IngestIn, FramerOut>>,
-        emit: Safe<Refused<EmitIn, FramerOut>>,
-        encode: Safe<Refused<EncodeIn, FramerOut>>,
-        refuse: Safe<Refused<RefuseIn, FramerOut>>,
-        finish: Safe<Refused<FinishIn, FramerOut>>,
-        detach: Safe<Refused<FramingIn, FramerOut>>,
-        adopt: Safe<Refused<AdoptIn, FramerOut>>,
-        timer: Safe<Refused<FramingIn, FramerOut>>,
+        locate: Safe<Locate>,
+        begin: Safe<Begin>,
+        ingest: Safe<Ingest>,
+        emit: Safe<Emit>,
+        encode: Safe<Encode>,
+        refuse: Safe<RefuseFrame>,
+        finish: Safe<Finish>,
+        detach: Safe<Detach>,
+        adopt: Safe<Adopt>,
+        timer: Safe<Timer>,
     },
 }

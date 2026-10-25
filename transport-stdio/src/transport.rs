@@ -33,21 +33,21 @@
 //!   running program is no end.
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use crate::supervisor::Supervisor;
-use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
-use busbar_contract::abi::mechanism::ticket::CompletionHandle;
-use busbar_contract::abi::sdk::door::{AbiIn, AbiOut};
+use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
+use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::io::{Io, IoFailure};
 use busbar_contract::abi::sdk::life::{settings_object, Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::{Instance, Lent, Out, SafeSlot};
 use busbar_contract::abi::transport::{
-    ArrivalIn, ArrivalOut, ConnIn, ConnOut, DialIn, IoOut, ReadIn, ShutIn, WriteIn,
-    CANCEL_NOTHING_MOVED, DEST_PROGRAM, READ_END_OF_FRAME, WRITE_END_OF_FRAME,
+    AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
+    EncodeIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut, ListenIn, ListenOut, LocateIn,
+    LocateOut, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED, DEST_PROGRAM,
+    READ_END_OF_FRAME, WRITE_END_OF_FRAME,
 };
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
 
@@ -74,16 +74,24 @@ const KEEP_BYTES: usize = 256 * 1024;
 const READ_CHUNK: usize = 16 * 1024;
 
 /// Why `validate`, `open` or `refresh` fails when the request-body bound is no count of bytes.
-pub const NOT_A_COUNT: &str = "settings: limits.request_body_max_bytes must be a count of bytes";
+pub const NOT_A_COUNT: &str =
+    "settings: limits.request_body_max_bytes must be a count of bytes above 0";
 
 /// The line ceiling `settings` states: its [`BODY_MAX_BYTES`], or [`MAX_LINE_BYTES`] when it states
 /// none.
 fn ceiling(settings: &[u8]) -> Result<usize, Refusal> {
-    match settings_object(settings)?.get(BODY_MAX_BYTES) {
+    let object = settings_object(settings)?;
+    if let Some(key) = object.keys().find(|k| k.as_str() != BODY_MAX_BYTES) {
+        return Err(Refusal::failed(format!(
+            "settings: {key} is not a setting this transport reads"
+        )));
+    }
+    match object.get(BODY_MAX_BYTES) {
         None => Ok(MAX_LINE_BYTES),
         Some(v) => v
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
             .ok_or_else(|| Refusal::failed(NOT_A_COUNT)),
     }
 }
@@ -126,12 +134,12 @@ fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
 }
 
 /// Why a read fails.
-pub const TOO_LONG: &str = "a line ran past the stdio line ceiling without a newline";
+pub const TOO_LONG: &str = "read: a line ran past the stdio line ceiling without a newline";
 /// Why a write fails when the frame it gathers passes the line ceiling.
-pub const FRAME_TOO_LONG: &str = "a frame ran past the stdio line ceiling";
+pub const FRAME_TOO_LONG: &str = "write: a frame ran past the stdio line ceiling";
 /// Why a write fails when its frame cannot be one line.
 pub const NOT_ONE_LINE: &str =
-    "a message holding a newline, or ending in a carriage return, is not one line";
+    "write: a message holding a newline, or ending in a carriage return, is not one line";
 
 /// The line being answered, as positions in [`Conn::inbound`].
 #[derive(Clone, Copy)]
@@ -267,15 +275,31 @@ fn now(i: &Instance<'_, State>) -> Option<u64> {
     services.clock_now(handle).ok().map(|r| r.mono_ns)
 }
 
-/// The open instance and the host's I/O for this op, or the refusal a call on none earns.
-fn carried<'a>(i: &Instance<'a, State>) -> Result<(&'a Carried, Io<'a>), Refusal> {
-    let held = i.get().ok_or_else(|| Refusal::failed("no open instance"))?;
+/// The open instance and the host's I/O for this op, or the refusal a call on none earns. Both
+/// texts are static, so they are answered with no instance to keep them.
+fn carried_with<'a>(
+    i: &Instance<'a, State>,
+    no_instance: &'static str,
+    no_io: &'static str,
+) -> Result<(&'a Carried, Io<'a>), Refusal> {
+    let held = i.get().ok_or_else(|| Refusal::failed(no_instance))?;
     let io = held
         .host()
         .map(|h| h.io(i.ticket()))
         .filter(Io::armed)
-        .ok_or_else(|| Refusal::failed("the host lent this carrier no I/O"))?;
+        .ok_or_else(|| Refusal::failed(no_io))?;
     Ok((held.life(), io))
+}
+
+/// [`carried_with`] for the op named by the literal `$op`.
+macro_rules! carried {
+    ($inst:expr, $op:literal) => {
+        carried_with(
+            &$inst,
+            concat!($op, ": no open instance"),
+            concat!($op, ": the host lent this carrier no I/O"),
+        )
+    };
 }
 
 /// The host's answer, as this op's refusal: the host's policy is REFUSED, the system's FAILED.
@@ -288,13 +312,13 @@ fn refusal(e: &IoFailure) -> Refusal {
 
 /// Run `body` over the instance, its I/O and the connection `conn`, failing the op without one.
 macro_rules! over {
-    ($inst:expr, $o:expr, $conn:expr, |$carried:ident, $io:ident, $c:ident| $body:block) => {{
-        let ($carried, mut $io) = match carried(&$inst) {
+    ($op:literal, $inst:expr, $o:expr, $conn:expr, |$carried:ident, $io:ident, $c:ident| $body:block) => {{
+        let ($carried, mut $io) = match carried!($inst, $op) {
             Ok(x) => x,
             Err(r) => return $o.fail(r),
         };
         let Some(conn) = $carried.conn($conn) else {
-            return $o.fail(Refusal::failed("no such connection"));
+            return $o.fail(Refusal::failed(concat!($op, ": no such connection")));
         };
         let mut $c = lock(&conn);
         $body
@@ -396,16 +420,72 @@ impl Conn {
 
 // ── the roles it does not play ──────────────────────────────────────────────────────────────────
 
-/// A slot of a role this carrier does not play (every framer op; `listen` and `accept`: a stdio
-/// carrier listens on nothing): REFUSED.
-pub struct Refused<I, O>(PhantomData<(I, O)>);
+/// Declares the slot of a role this carrier does not play (every framer op; `listen` and
+/// `accept`: a stdio carrier listens on nothing): REFUSED, with that op's own static text.
+macro_rules! refused {
+    ($($(#[$doc:meta])* $name:ident($in:ty => $out:ty) $op:literal;)*) => {$(
+        $(#[$doc])*
+        pub struct $name;
+        impl SafeSlot for $name {
+            type In = $in;
+            type Out = $out;
+            type State = State;
+            fn call(_: Instance<'_, State>, _: Lent<'_, $in>, mut o: Out<'_, $out>) -> Outcome {
+                o.fail(Refusal::refused(concat!(
+                    $op,
+                    ": the stdio carrier does not serve this op"
+                )))
+            }
+        }
+    )*};
+}
 
-impl<I: AbiIn, O: AbiOut> SafeSlot for Refused<I, O> {
-    type In = I;
-    type Out = O;
+refused! {
+    /// `listen`: a stdio carrier listens on nothing.
+    Listen(ListenIn => ListenOut) "listen";
+    /// `accept`: nothing is listened on.
+    Accept(AcceptIn => AcceptOut) "accept";
+    /// `locate`: a framer op.
+    Locate(LocateIn => LocateOut) "locate";
+    /// `begin`: a framer op.
+    Begin(BeginIn => FramerOut) "begin";
+    /// `ingest`: a framer op.
+    Ingest(IngestIn => FramerOut) "ingest";
+    /// `emit`: a framer op.
+    Emit(EmitIn => FramerOut) "emit";
+    /// `encode`: a framer op.
+    Encode(EncodeIn => FramerOut) "encode";
+    /// `refuse`: a framer op.
+    RefuseFrame(RefuseIn => FramerOut) "refuse";
+    /// `finish`: a framer op.
+    Finish(FinishIn => FramerOut) "finish";
+    /// `detach`: a framer op.
+    Detach(FramingIn => FramerOut) "detach";
+    /// `adopt`: a framer op.
+    Adopt(AdoptIn => FramerOut) "adopt";
+    /// `timer`: a framer op.
+    Timer(FramingIn => FramerOut) "timer";
+}
+
+/// `close` (the instance's): every connection handle still held is closed through the host's I/O,
+/// errors ignored (the host kills a spawned program with its handle), then READY; the SDK drops
+/// the state.
+pub struct Close;
+impl SafeSlot for Close {
+    type In = InHead;
+    type Out = OutHead;
     type State = State;
-    fn call(_: Instance<'_, State>, _: Lent<'_, I>, _: Out<'_, O>) -> Outcome {
-        Outcome::Refused
+    fn call(inst: Instance<'_, State>, _: Lent<'_, InHead>, _: Out<'_, OutHead>) -> Outcome {
+        if let Some(held) = inst.get() {
+            let conns: Vec<_> = lock(&held.life().conns).drain().map(|(_, c)| c).collect();
+            if let Some(host) = held.host() {
+                let mut io = host.io(Ticket::NONE);
+                for conn in conns {
+                    let _ = io.close(lock(&conn).io);
+                }
+            }
+        }
+        Outcome::Ready
     }
 }
 
@@ -426,7 +506,7 @@ impl SafeSlot for Dial {
                 "dial: a stdio carrier reaches a program, never an authority",
             ));
         }
-        let (c, mut io) = match carried(&inst) {
+        let (c, mut io) = match carried!(inst, "dial") {
             Ok(x) => x,
             Err(r) => return o.fail(r),
         };
@@ -481,7 +561,7 @@ impl SafeSlot for Read {
     type Out = IoOut;
     type State = State;
     fn call(inst: Instance<'_, State>, i: Lent<'_, ReadIn>, mut o: Out<'_, IoOut>) -> Outcome {
-        over!(inst, o, i.conn, |carried, io, c| {
+        over!("read", inst, o, i.conn, |carried, io, c| {
             let mut buf = i.buf();
             let max = carried.ceiling();
             loop {
@@ -544,7 +624,7 @@ impl SafeSlot for Write {
     fn call(inst: Instance<'_, State>, i: Lent<'_, WriteIn>, mut o: Out<'_, IoOut>) -> Outcome {
         let bytes = i.bytes();
         let end = i.flags & WRITE_END_OF_FRAME != 0;
-        over!(inst, o, i.conn, |carried, io, c| {
+        over!("write", inst, o, i.conn, |carried, io, c| {
             // What the pipe has not taken goes first; past the cap, nothing more is taken.
             match c.drain(&mut io) {
                 Poll::Ready(Err(e)) => {
@@ -593,7 +673,7 @@ impl SafeSlot for Flush {
     type Out = OutHead;
     type State = State;
     fn call(inst: Instance<'_, State>, i: Lent<'_, ConnIn>, mut o: Out<'_, OutHead>) -> Outcome {
-        over!(inst, o, i.conn, |carried, io, c| {
+        over!("flush", inst, o, i.conn, |carried, io, c| {
             match c.drain(&mut io) {
                 Poll::Pending => Outcome::Pending,
                 Poll::Ready(Ok(())) => Outcome::Ready,
@@ -614,7 +694,7 @@ impl SafeSlot for Shut {
     type Out = OutHead;
     type State = State;
     fn call(inst: Instance<'_, State>, i: Lent<'_, ShutIn>, mut o: Out<'_, OutHead>) -> Outcome {
-        let (c, mut io) = match carried(&inst) {
+        let (c, mut io) = match carried!(inst, "shut") {
             Ok(x) => x,
             Err(r) => return o.fail(r),
         };
