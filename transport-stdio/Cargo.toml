@@ -4,7 +4,7 @@ name = "busbar-transport-stdio"
 version = "1.6.0"
 publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
-rust-version = "1.97"
+rust-version.workspace = true
 description = "The stdio transport: the carrier of a spawned program's pipes, one frame per line, over the host's I/O."
 license = "Apache-2.0"
 
@@ -21,3 +21,6 @@ crate-type = ["rlib"]
 # busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE copy
 # of the contract links.
 busbar-contract = { workspace = true }
+
+[lints]
+workspace = true
