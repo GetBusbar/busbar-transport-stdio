@@ -86,6 +86,10 @@ struct Script {
     mono_ns: u64,
     /// Whether the next spawn fails.
     spawn_fails: bool,
+    /// Whether the next spawn is REFUSED by the host's policy (not a system failure).
+    spawn_refused: bool,
+    /// Whether a read FAILS (the pipe errors) rather than answering.
+    read_fails: bool,
     /// Whether a read finds the program ended (`true`) or running (`false`: PENDING).
     ended: bool,
     /// The handle the next spawn answers.
@@ -102,6 +106,8 @@ struct Script {
 static SCRIPT: Mutex<Script> = Mutex::new(Script {
     mono_ns: 1_000 * MS,
     spawn_fails: false,
+    spawn_refused: false,
+    read_fails: false,
     ended: true,
     next_handle: 1,
     spawns: 0,
@@ -125,12 +131,14 @@ fn answer(out: *mut ServiceOut, o: Outcome, value: u64, len: u64) -> RawOutcome 
 }
 
 extern "C" fn io_spawn(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> RawOutcome {
-    let (fails, h) = with(|sc| {
+    let (fails, refused, h) = with(|sc| {
         sc.spawns += 1;
         sc.next_handle += 1;
-        (sc.spawn_fails, sc.next_handle)
+        (sc.spawn_fails, sc.spawn_refused, sc.next_handle)
     });
-    if fails {
+    if refused {
+        answer(out, Outcome::Refused, 0, 0)
+    } else if fails {
         answer(out, Outcome::Failed, 0, 0)
     } else {
         answer(out, Outcome::Ready, h, 0)
@@ -140,6 +148,9 @@ extern "C" fn io_spawn(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> Ra
 extern "C" fn io_read(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
     let i = unsafe { input.cast::<IoReadIn>().read() };
+    if with(|sc| sc.read_fails) {
+        return answer(out, Outcome::Failed, 0, 0);
+    }
     if with(|sc| sc.flood.checked_sub(1).map(|n| sc.flood = n).is_some()) {
         // SAFETY: the carrier's buffer, `cap` bytes.
         unsafe { std::ptr::write_bytes(i.buf, b'x', i.cap) };
@@ -208,6 +219,8 @@ impl Carrier {
         *SCRIPT.lock().unwrap() = Script {
             mono_ns: 1_000 * MS,
             spawn_fails: false,
+            spawn_refused: false,
+            read_fails: false,
             ended: true,
             next_handle: 1,
             spawns: 0,
@@ -249,7 +262,7 @@ impl Carrier {
         (r, conn)
     }
 
-    /// As [`Carrier::dial`], and why when it fails.
+    /// As [`Carrier::dial`], and why (the dial's error text, empty when it gave none).
     fn dial_why(&self, key: u64, token: &str) -> (Outcome, u64, String) {
         let env = [Field {
             name: s("TOKEN"),
@@ -299,6 +312,16 @@ impl Carrier {
         (r, why)
     }
 
+    /// Assert the member `key`'s dial is REFUSED with the hold-down reason (`msg` says why).
+    fn assert_held_down(&self, key: u64, token: &str, msg: &str) {
+        let (r, _, why) = self.dial_why(key, token);
+        assert_eq!(r, Outcome::Refused, "{msg}");
+        assert!(
+            why.contains("held down"),
+            "{msg}: the reason is the hold-down: {why:?}"
+        );
+    }
+
     fn shut(&self, conn: u64) {
         let mut i: ShutIn = z();
         i.conn = conn;
@@ -341,19 +364,11 @@ fn a_program_that_keeps_ending_is_held_down_then_stopped() {
     let _one = ONE.lock().unwrap();
     let c = Carrier::open();
     c.run_to_end(1, "a");
-    assert_eq!(
-        c.dial(1, "a").0,
-        Outcome::Refused,
-        "held down inside the backoff"
-    );
+    c.assert_held_down(1, "a", "held down inside the backoff");
     advance(100 * MS);
     c.run_to_end(1, "a");
     advance(100 * MS);
-    assert_eq!(
-        c.dial(1, "a").0,
-        Outcome::Refused,
-        "the backoff doubled to 200 ms"
-    );
+    c.assert_held_down(1, "a", "the backoff doubled to 200 ms");
     advance(100 * MS);
     c.run_to_end(1, "a");
     advance(400 * MS);
@@ -361,11 +376,7 @@ fn a_program_that_keeps_ending_is_held_down_then_stopped() {
     advance(800 * MS);
     c.run_to_end(1, "a");
     advance(3_600_000 * MS);
-    assert_eq!(
-        c.dial(1, "a").0,
-        Outcome::Refused,
-        "five ends in a minute: stopped"
-    );
+    c.assert_held_down(1, "a", "five ends in a minute: stopped");
 }
 
 /// A spawn that fails is counted like any end.
@@ -374,12 +385,50 @@ fn a_spawn_that_fails_counts_as_an_end() {
     let _one = ONE.lock().unwrap();
     let c = Carrier::open();
     with(|sc| sc.spawn_fails = true);
-    assert_ne!(c.dial(2, "a").0, Outcome::Ready);
-    with(|sc| sc.spawn_fails = false);
     assert_eq!(
         c.dial(2, "a").0,
-        Outcome::Refused,
-        "held down after the failed spawn"
+        Outcome::Failed,
+        "a system failure of the spawn is FAILED"
+    );
+    with(|sc| sc.spawn_fails = false);
+    let (r, _, why) = c.dial_why(2, "a");
+    assert_eq!(r, Outcome::Refused, "held down after the failed spawn");
+    assert!(
+        why.contains("held down"),
+        "the reason is the hold-down: {why:?}"
+    );
+}
+
+/// A spawn the host's POLICY refuses answers REFUSED, not FAILED: the host's refusal is not a
+/// system failure.
+#[test]
+fn a_spawn_the_host_refuses_is_refused() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    with(|sc| sc.spawn_refused = true);
+    assert_eq!(c.dial(3, "a").0, Outcome::Refused);
+}
+
+/// A read the pipe fails (the host answers a failure, not a line past the ceiling) is an END of
+/// the program: counted then, so the shut of the connection does not read it as clean.
+#[test]
+fn a_failed_pipe_read_is_an_end() {
+    let _one = ONE.lock().unwrap();
+    let c = Carrier::open();
+    let (r, conn) = c.dial(4, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.read_fails = true;
+    });
+    assert_eq!(c.read(conn), Outcome::Failed);
+    with(|sc| sc.read_fails = false);
+    c.shut(conn);
+    let (r, _, why) = c.dial_why(4, "a");
+    assert_eq!(r, Outcome::Refused, "held down after the failed read");
+    assert!(
+        why.contains("held down"),
+        "the reason is the hold-down: {why:?}"
     );
 }
 
@@ -389,11 +438,7 @@ fn two_members_running_one_program_trip_independently() {
     let _one = ONE.lock().unwrap();
     let c = Carrier::open();
     c.trip(10, "a");
-    assert_eq!(
-        c.dial(10, "a").0,
-        Outcome::Refused,
-        "the first member tripped"
-    );
+    c.assert_held_down(10, "a", "the first member tripped");
     assert_eq!(
         c.dial(11, "a").0,
         Outcome::Ready,
@@ -407,7 +452,7 @@ fn a_member_dropped_and_re_added_is_fresh() {
     let _one = ONE.lock().unwrap();
     let c = Carrier::open();
     c.trip(20, "a");
-    assert_eq!(c.dial(20, "a").0, Outcome::Refused);
+    c.assert_held_down(20, "a", "the tripped member");
     assert_eq!(
         c.dial(21, "a").0,
         Outcome::Ready,
@@ -421,10 +466,10 @@ fn a_rotated_secret_value_does_not_reset_a_trip() {
     let _one = ONE.lock().unwrap();
     let c = Carrier::open();
     c.trip(30, "old-secret");
-    assert_eq!(
-        c.dial(30, "rotated-secret").0,
-        Outcome::Refused,
-        "the same member, a new environment value: still stopped"
+    c.assert_held_down(
+        30,
+        "rotated-secret",
+        "the same member, a new environment value: still stopped",
     );
 }
 
@@ -450,11 +495,7 @@ fn a_program_found_ended_at_its_shut_is_an_end() {
     assert_eq!(r, Outcome::Ready);
     with(|sc| sc.ended = true);
     c.shut(conn);
-    assert_eq!(
-        c.dial(50, "a").0,
-        Outcome::Refused,
-        "its end was counted at the shut"
-    );
+    c.assert_held_down(50, "a", "its end was counted at the shut");
 }
 
 /// A key of `0` names no member (a one-shot program line): it is not supervised.
@@ -501,11 +542,7 @@ fn an_end_met_without_a_clock_is_counted_once_the_clock_answers() {
     let _ = c.read(conn);
     with(|sc| sc.clock_fails = false);
     c.shut(conn);
-    assert_eq!(
-        c.dial(60, "a").0,
-        Outcome::Refused,
-        "the end was counted at the shut"
-    );
+    c.assert_held_down(60, "a", "the end was counted at the shut");
 }
 
 /// Full reads of output (the carrier reads 16 KiB at a time) that carry a member's line past the
@@ -535,11 +572,7 @@ fn a_line_past_the_ceiling_is_an_end() {
         "the line ran past the ceiling"
     );
     c.shut(conn);
-    assert_eq!(
-        c.dial(70, "a").0,
-        Outcome::Refused,
-        "held down after the read the program failed"
-    );
+    c.assert_held_down(70, "a", "held down after the read the program failed");
 }
 
 /// A read the program failed while the host's clock did not answer is counted once it answers
@@ -558,11 +591,7 @@ fn a_line_past_the_ceiling_met_without_a_clock_is_counted_at_the_shut() {
     assert_eq!(c.read(conn), Outcome::Failed);
     with(|sc| sc.clock_fails = false);
     c.shut(conn);
-    assert_eq!(
-        c.dial(71, "a").0,
-        Outcome::Refused,
-        "the failed read was counted at the shut"
-    );
+    c.assert_held_down(71, "a", "the failed read was counted at the shut");
 }
 
 /// A program that exited behind a FULL pipe (1 MiB, the most an unprivileged program can size its
@@ -580,9 +609,9 @@ fn a_program_that_exited_behind_a_full_pipe_is_found_ended_at_its_shut() {
         sc.flood = 1024 * 1024 / (16 * 1024);
     });
     c.shut(conn);
-    assert_eq!(
-        c.dial(80, "a").0,
-        Outcome::Refused,
-        "its end behind a full pipe was counted at the shut"
+    c.assert_held_down(
+        80,
+        "a",
+        "its end behind a full pipe was counted at the shut",
     );
 }
