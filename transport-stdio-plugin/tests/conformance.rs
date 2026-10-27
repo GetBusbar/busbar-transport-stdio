@@ -11,7 +11,7 @@
 //! crossings exactly at the script's pin, the two folds equal, and the suite's RED arms kept.
 //! `plugin-ci.yml` runs it under `--release`.
 
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     door: busbar_transport_stdio::door::door,
     cdylib: "busbar_transport_stdio_plugin",
     inputs: include_str!("conformance.json"),
