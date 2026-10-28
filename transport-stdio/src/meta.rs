@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! What this transport declares about itself, as the kind's own file (`BUSBAR-1.6.0.md` THE
-//! DESIGN, §2): the key it answers on, the one setting it reads and the transport kind's tail its
-//! door states. Read once at registration and sealed, so it is data, held apart from the carrier
-//! code it describes.
+//! What this transport declares about itself: the key it answers on, the one setting it reads and
+//! the transport kind's tail its door states. Read once at registration and sealed, so it is data,
+//! held apart from the carrier code it describes.
 
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::transport::{
@@ -34,8 +33,8 @@ const fn count(text: &str) -> usize {
 // The declared default is the ceiling the carrier falls back to: one fact, held equal.
 const _: () = assert!(count(DEFAULT_BODY_MAX) == MAX_LINE_BYTES);
 
-/// The one setting this transport reads, at its 1.5.5 path: the deployment's request-body bound,
-/// its line ceiling (THE DESIGN §5: a transport's knobs reach it as the settings its door declares).
+/// The one setting this transport reads: the deployment's request-body bound, its line ceiling (a
+/// transport's knobs reach it as the settings its door declares).
 const SETTINGS: &[SettingDecl] = &[SettingDecl {
     path: abi_str(BODY_MAX_BYTES),
     kind: SETTING_COUNT,

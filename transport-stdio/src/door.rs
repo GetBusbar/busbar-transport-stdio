@@ -6,7 +6,7 @@
 //! is a [`SafeSlot`](busbar_contract::abi::sdk::SafeSlot) over the SDK's generic lifecycle
 //! (`life(Carried)`): no `unsafe` here.
 //!
-//! The program and its pipes are the host's (`BUSBAR-1.6.0.md` THE DESIGN, §5): this carrier spawns,
+//! The program and its pipes are the host's: this carrier spawns,
 //! reads, writes and closes through the host's I/O (`io.*`) and owns the line semantics over them
 //! ([`crate::transport`]): one frame per line in, one line per frame out. `listen`, `accept` and
 //! every framer op are REFUSED.

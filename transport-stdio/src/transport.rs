@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The `stdio` CARRIER, as the kind's own file (`BUSBAR-1.6.0.md` THE DESIGN, §2 and §5;
-//! TRANSPORT-STACK (2)): the carrier ops over the HOST'S I/O (`busbar_contract::abi::host::io`,
+//! The `stdio` CARRIER: the carrier ops over the HOST'S I/O (`busbar_contract::abi::host::io`,
 //! `io.*`), and the framer ops refused. The host owns the program and its pipes; this carrier holds
 //! only the host's opaque handle and owns the policy over it:
 //!
@@ -20,13 +19,13 @@
 //!   contract's carrier script states for a frame the carrier will not carry. What the pipe has not
 //!   taken is written by the next `write` or `flush`.
 //! * THE LINE CEILING is the deployment's request-body bound, the one setting this carrier reads
-//!   ([`BODY_MAX_BYTES`], at its 1.5.5 path; [`MAX_LINE_BYTES`] when the host hands none), taken at
+//!   ([`BODY_MAX_BYTES`]; [`MAX_LINE_BYTES`] when the host hands none), taken at
 //!   `open` and moved by each `refresh`: the host holds one inbound message of a byte channel to
 //!   that bound, so a message the gateway takes through its front door crosses a stdio pipe whole,
 //!   either way.
 //! * `flush` writes what is queued; `shut` closes the handle (the host kills the program) and
 //!   forgets the connection; `arrival` answers no far end and no port.
-//! * THE SUPERVISOR is this carrier's (THE DESIGN §2, l.388; [`crate::supervisor`]): a dial for a
+//! * THE SUPERVISOR is this carrier's ([`crate::supervisor`]): a dial for a
 //!   member (`DialIn::supervision_key` not `0`) is REFUSED while that member's program is held
 //!   down, and every end of it — its output closed, a failed pipe, a line past the ceiling, a failed
 //!   spawn, or found ended when it is shut — is counted on the host's one clock. A clean shut of a
@@ -51,7 +50,7 @@ use busbar_contract::abi::transport::{
 };
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
 
-/// The setting this carrier reads, at its 1.5.5 path: the deployment's request-body bound, which
+/// The setting this carrier reads: the deployment's request-body bound, which
 /// is its LINE CEILING, the longest line it frames before its terminator (a line is one frame on
 /// this wire). Past it the line is a framing fault, not a big frame.
 pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
@@ -152,8 +151,6 @@ struct Line {
     next: usize,
 }
 
-// ── the instance ─────────────────────────────────────────────────────────────────────────────────
-
 /// What one instance carries: its connections, each by the token it minted, the supervision of
 /// every member it has run a program for, by the member's supervision key, and its line ceiling.
 pub struct Carried {
@@ -167,7 +164,7 @@ pub struct Carried {
 
 /// One program's connection: the host's handle, the line being cut on the way in, the frame being
 /// gathered and the bytes queued on the way out. A line is answered straight out of `inbound`, so
-/// the data path allocates nothing once its buffers are warm (THE DESIGN §11.2).
+/// the data path allocates nothing once its buffers are warm.
 #[derive(Default)]
 struct Conn {
     io: u64,
@@ -263,7 +260,7 @@ impl Carried {
     }
 }
 
-/// The host's monotonic clock now (THE DESIGN §1: one clock, lent to transports, l.291); `None`
+/// The host's monotonic clock now (one clock, lent to transports); `None`
 /// when the host lends no clock.
 fn now(i: &Instance<'_, State>) -> Option<u64> {
     let services = i.get()?.host()?.services()?;
@@ -418,8 +415,6 @@ impl Conn {
     }
 }
 
-// ── the roles it does not play ──────────────────────────────────────────────────────────────────
-
 /// Declares the slot of a role this carrier does not play (every framer op; `listen` and
 /// `accept`: a stdio carrier listens on nothing): REFUSED, with that op's own static text.
 macro_rules! refused {
@@ -488,8 +483,6 @@ impl SafeSlot for Close {
         Outcome::Ready
     }
 }
-
-// ── the carrier ──────────────────────────────────────────────────────────────────────────────────
 
 /// `dial`: spawn the program, through the host. An authority is not this carrier's destination.
 pub struct Dial;
