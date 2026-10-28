@@ -3,7 +3,7 @@
 
 //! The `stdio` transport: the CARRIER of a spawned program's pipes, one frame per line.
 //!
-//! No plugin opens a socket or a pipe (`BUSBAR-1.6.0.md` THE DESIGN, §5): the host spawns the
+//! No plugin opens a socket or a pipe: the host spawns the
 //! program (an absolute path, its arguments and its whole environment, no shell), owns its pipes and
 //! kills it when the connection closes. This crate holds only the host's opaque handle ([`door`])
 //! and owns the policy over it: the spawn it asks for, one frame per line on the way in, one line
@@ -18,17 +18,16 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-// THE KIND'S SHAPE (`BUSBAR-1.6.0.md` THE DESIGN, §2), the same files every transport twin
-// carries: what it declares (`meta`), what it claims (`claims`), the entry (`transport`), and the
-// door that states them.
+// What it declares (`meta`), what it claims (`claims`), the entry (`transport`), and the door that
+// states them.
 mod claims;
 pub mod door;
 mod meta;
 pub mod supervisor;
 mod transport;
 
-/// THE TRANSPORT AXIS ENTRY: what the composition root folds for this transport: its key, the
-/// layers it declares and its door. The root names none of them.
+/// The transport axis entry the composition root folds for this transport: its key, the layers it
+/// declares and its door.
 pub mod linked {
     /// The row's registry key.
     pub const KEY: &str = crate::door::KEY;
