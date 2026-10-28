@@ -564,6 +564,9 @@ impl SafeSlot for Read {
         over!("read", inst, o, i.conn, |carried, io, c| {
             let mut buf = i.buf();
             let max = carried.ceiling();
+            // Zeroed once per call, not per pipe read: the code forbids `unsafe`, and a read
+            // overwrites what it fills.
+            let mut chunk = [0_u8; READ_CHUNK];
             loop {
                 if let Some(mut line) = c.line {
                     let n = buf.stream(&c.inbound[line.at..line.end]);
@@ -596,7 +599,6 @@ impl SafeSlot for Read {
                     }
                 }
                 c.compact();
-                let mut chunk = [0_u8; READ_CHUNK];
                 match io.read(c.io, &mut chunk) {
                     Poll::Pending => return Outcome::Pending,
                     Poll::Ready(Ok(0)) => {
