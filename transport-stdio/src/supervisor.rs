@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE STDIO SUPERVISOR (`BUSBAR-1.6.0.md` THE DESIGN §2, l.388: "the stdio supervisor is the stdio
-//! transport's"): the restart policy of a program that keeps ending, the crash-loop policy predev's
-//! connector held (`program.rs`, the MCP baseline, FOLD-MCP F25) before it moved here; v1.5.5 had
-//! no stdio transport and no program supervisor. A circuit breaker, not a retry loop: each end is
-//! timed on the host's one clock (monotonic, `clock.now`, THE DESIGN §1 and l.291); the next spawn
+//! The stdio supervisor: the restart policy of a program that keeps ending. A circuit breaker, not a
+//! retry loop: each end is timed on the host's one clock (monotonic, `clock.now`); the next spawn
 //! waits a backoff doubling from [`BASE_BACKOFF_NS`] to [`MAX_BACKOFF_NS`], and [`CRASH_THRESHOLD`]
 //! ends inside [`CRASH_WINDOW_NS`] stop the restarts until the member is declared anew.
 //!
@@ -26,7 +23,7 @@ pub const CRASH_THRESHOLD: usize = 5;
 /// The window the ends are counted over.
 pub const CRASH_WINDOW_NS: u64 = 60_000 * MS;
 
-/// THE RESTART POLICY of one member's program, on the host's monotonic clock.
+/// The restart policy of one member's program, on the host's monotonic clock.
 #[derive(Debug, Default)]
 pub struct Supervisor {
     /// The ends inside the window, oldest first.
