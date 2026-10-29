@@ -16,9 +16,6 @@
 
 use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
-use busbar_contract::abi::sdk::life::{
-    Cancel, Drive, Open, Refresh, Release, Retire, Tick, Validate,
-};
 use busbar_contract::abi::sdk::Safe;
 use busbar_contract::abi::transport::Ops;
 
@@ -26,8 +23,8 @@ use crate::claims::CLAIM_NAMES;
 pub use crate::meta::KEY;
 use crate::meta::TAIL;
 pub use crate::transport::{
-    Accept, Adopt, Arrival, Begin, Carried, Close, Detach, Dial, Emit, Encode, Finish, Flush,
-    Ingest, Listen, Locate, Read, RefuseFrame, Shut, Timer, Write, BODY_MAX_BYTES, FRAME_TOO_LONG,
+    Accept, Adopt, Arrival, Begin, Carried, Detach, Dial, Emit, Encode, Finish, Flush, Ingest,
+    Listen, Locate, Read, RefuseFrame, Shut, Timer, Write, BODY_MAX_BYTES, FRAME_TOO_LONG,
     MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, TOO_LONG,
 };
 
@@ -51,17 +48,7 @@ pub const STATEMENT: Statement = {
 busbar_contract::plugin_door! {
     ops: Ops,
     statement: STATEMENT,
-    lifecycle: {
-        validate: Safe<Validate<Carried>>,
-        open: Safe<Open<Carried>>,
-        refresh: Safe<Refresh<Carried>>,
-        retire: Safe<Retire<Carried>>,
-        tick: Safe<Tick<Carried>>,
-        drive: Safe<Drive<Carried>>,
-        cancel: Safe<Cancel<Carried>>,
-        release: Safe<Release<Carried>>,
-        close: Safe<Close>,
-    },
+    lifecycle: life(Carried),
     kind_ops: {
         listen: Safe<Listen>,
         accept: Safe<Accept>,
