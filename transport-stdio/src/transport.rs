@@ -37,8 +37,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use crate::supervisor::Supervisor;
-use busbar_contract::abi::mechanism::call::{InHead, OutHead, Outcome};
+use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
+use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::io::{Io, IoFailure};
 use busbar_contract::abi::sdk::life::{settings_object, Held, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::{Instance, Lent, Out, SafeSlot};
@@ -217,6 +218,19 @@ impl Life for Carried {
     fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
         self.ceiling.store(ceiling(settings)?, Ordering::Relaxed);
         Ok(Refreshed::default())
+    }
+
+    /// `close` (the instance's): every connection handle still held is closed through the host's
+    /// I/O, errors ignored (the host kills a spawned program with its handle); the SDK answers
+    /// READY and drops the state.
+    fn close(&self, host: Option<&Host>) {
+        let conns: Vec<_> = lock(&self.conns).drain().map(|(_, c)| c).collect();
+        if let Some(host) = host {
+            let mut io = host.io(Ticket::NONE);
+            for conn in conns {
+                let _ = io.close(lock(&conn).io);
+            }
+        }
     }
 }
 
@@ -460,28 +474,6 @@ refused! {
     Adopt(AdoptIn => FramerOut) "adopt";
     /// `timer`: a framer op.
     Timer(FramingIn => FramerOut) "timer";
-}
-
-/// `close` (the instance's): every connection handle still held is closed through the host's I/O,
-/// errors ignored (the host kills a spawned program with its handle), then READY; the SDK drops
-/// the state.
-pub struct Close;
-impl SafeSlot for Close {
-    type In = InHead;
-    type Out = OutHead;
-    type State = State;
-    fn call(inst: Instance<'_, State>, _: Lent<'_, InHead>, _: Out<'_, OutHead>) -> Outcome {
-        if let Some(held) = inst.get() {
-            let conns: Vec<_> = lock(&held.life().conns).drain().map(|(_, c)| c).collect();
-            if let Some(host) = held.host() {
-                let mut io = host.io(Ticket::NONE);
-                for conn in conns {
-                    let _ = io.close(lock(&conn).io);
-                }
-            }
-        }
-        Outcome::Ready
-    }
 }
 
 /// `dial`: spawn the program, through the host. An authority is not this carrier's destination.
