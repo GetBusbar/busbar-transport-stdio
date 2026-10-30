@@ -16,6 +16,9 @@ use crate::transport::BODY_MAX_BYTES;
 /// The claim this entry answers for: the stdio row's key.
 pub const KEY: &str = "stdio";
 
+/// Whether this transport carries sessions (its claim row states `session = 1`).
+pub(crate) const SESSION: bool = true;
+
 /// The one setting this transport reads: the deployment's request-body bound, its line ceiling (a
 /// transport's knobs reach it as the settings its door declares).
 const SETTINGS: &[SettingDecl] = &[SettingDecl {
