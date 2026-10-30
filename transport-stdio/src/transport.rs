@@ -58,7 +58,8 @@ use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
 pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 
 /// The line ceiling when the host hands no [`BODY_MAX_BYTES`]: the host's own default request-body
-/// bound (32 MiB), the default the tail declares for the setting.
+/// bound (32 MiB). The tail declares it as the SDK's `DEFAULT_BODY_MAX`, which the SDK asserts at
+/// compile time is this same count.
 pub const MAX_LINE_BYTES: usize = DEFAULT_REQUEST_BODY_MAX_BYTES;
 
 /// The queued bytes past which a `write` takes nothing more and waits for the pipe to drain. It
