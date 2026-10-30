@@ -606,12 +606,21 @@ impl SafeSlot for Write {
                 emptied(&mut c.message);
                 return o.fail(Refusal::failed(FRAME_TOO_LONG));
             }
-            c.message.extend_from_slice(bytes);
-            if end {
+            if !end {
+                c.message.extend_from_slice(bytes);
+            } else {
                 let c = &mut *c;
-                let one_line = !c.message.contains(&b'\n') && c.message.last() != Some(&b'\r');
+                // A frame that arrives whole in one write is checked where it lies and queued
+                // straight to `outbound`, copied once; a gathered one is its gathered bytes.
+                let frame: &[u8] = if c.message.is_empty() {
+                    bytes
+                } else {
+                    c.message.extend_from_slice(bytes);
+                    &c.message
+                };
+                let one_line = !frame.contains(&b'\n') && frame.last() != Some(&b'\r');
                 if one_line {
-                    c.outbound.extend_from_slice(&c.message);
+                    c.outbound.extend_from_slice(frame);
                     c.outbound.push(b'\n');
                 }
                 emptied(&mut c.message);
