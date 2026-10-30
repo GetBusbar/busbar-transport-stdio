@@ -274,6 +274,15 @@ impl Carried {
         self.ended(c, now);
     }
 
+    /// Whether the member `key`'s program is held down at `at`. A key whose state holds nothing
+    /// reads as a fresh one: dropped, so the map holds only members inside their window and members
+    /// held down until declared anew.
+    fn held_down(&self, key: u64, at: u64) -> bool {
+        let mut supervised = lock(&self.supervised);
+        supervised.retain(|_, s| !s.idle(at));
+        supervised.get(&key).is_some_and(|s| !s.may_restart(at))
+    }
+
     /// The line ceiling now.
     fn ceiling(&self) -> usize {
         self.ceiling.load(Ordering::Relaxed)
@@ -482,14 +491,7 @@ impl SafeSlot for Dial {
             let Some(at) = now(&inst) else {
                 return o.fail(Refusal::failed(NO_CLOCK));
             };
-            let held_down = {
-                let mut supervised = lock(&c.supervised);
-                // A key whose state holds nothing reads as a fresh one: dropped, so the map holds
-                // only members inside their window and members held down until declared anew.
-                supervised.retain(|_, s| !s.idle(at));
-                supervised.get(&key).is_some_and(|s| !s.may_restart(at))
-            };
-            if held_down {
+            if c.held_down(key, at) {
                 return o.fail(Refusal::refused(HELD_DOWN));
             }
             Some(at)
