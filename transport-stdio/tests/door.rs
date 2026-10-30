@@ -25,7 +25,7 @@ use busbar_contract::abi::mechanism::call::{
 use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::extensions::declares;
 use busbar_contract::abi::mechanism::lifecycle::{
-    slot as life, OpenIn, OpenOut, RefreshIn, ValidateIn,
+    slot as life, OpenIn, OpenOut, RefreshIn, ReleaseIn, ValidateIn,
 };
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::check::check_tail;
@@ -1029,4 +1029,56 @@ fn the_statement_carries_the_declares_document() {
         Some(&include_bytes!("../declares.json")[..]),
         "declares.json rides the Statement, whole, under its key"
     );
+}
+
+/// `arrival` with no open instance says so, in the op's own words (the same as tcp's), and an
+/// unknown connection on an open instance keeps `no such connection`.
+#[test]
+fn arrival_with_no_instance_says_no_open_instance() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut i: ArrivalIn = z();
+    let mut o: ArrivalOut = z();
+    assert_eq!(
+        call(
+            ops().arrival,
+            std::ptr::null_mut(),
+            &mut i,
+            &mut o,
+            slot::ARRIVAL
+        ),
+        Outcome::Failed
+    );
+    assert_eq!(text(o.head.error), "arrival: no open instance");
+    let h = Host::new(Vec::new());
+    let mut i: ArrivalIn = z();
+    i.conn = h.conn + 1000;
+    let mut o: ArrivalOut = z();
+    assert_eq!(
+        call(ops().arrival, h.inst, &mut i, &mut o, slot::ARRIVAL),
+        Outcome::Failed
+    );
+    assert_eq!(text(o.head.error), "arrival: no such connection");
+}
+
+/// Releasing a lease this carrier never handed out is REFUSED in the SDK's words.
+#[test]
+fn releasing_a_lease_never_handed_out_is_refused() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::new(Vec::new());
+    let mut i: ReleaseIn = z();
+    i.lease = 7;
+    let mut o: OutHead = z();
+    assert_eq!(
+        call(ops().head.release, h.inst, &mut i, &mut o, life::RELEASE),
+        Outcome::Refused
+    );
+    assert_eq!(text(o.error), "release: no such lease");
+}
+
+/// A carrier states no op facts: the bits are framer terms.
+#[test]
+fn the_carrier_states_no_op_facts() {
+    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
+    let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
+    assert_eq!(tail.facts, 0);
 }
