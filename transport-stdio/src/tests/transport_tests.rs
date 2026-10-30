@@ -68,3 +68,28 @@ fn an_op_that_took_a_connection_before_its_shut_finds_it_gone() {
         "the op that took it before the shut finds it gone"
     );
 }
+
+/// A dial sweeps out every key whose supervisor holds nothing (it reads as a fresh one), so the
+/// carrier holds only members inside their window or held down, not one entry per member it ever
+/// ran. RED (codeaudit 94ae3e3, stdio tests LOW): only `Supervisor::idle` was tested, not the sweep.
+#[test]
+fn a_dial_drops_the_supervision_of_every_idle_member() {
+    let carried = Carried::open(b"", &[], 0).unwrap();
+    let window = crate::supervisor::CRASH_WINDOW_NS;
+    {
+        let mut supervised = lock(&carried.supervised);
+        supervised.entry(1).or_default().crashed(0);
+        supervised.entry(2).or_default().crashed(window);
+    }
+    let at = window + window / 2;
+    assert!(!carried.held_down(3, at), "a member never ended runs");
+    let supervised = lock(&carried.supervised);
+    assert!(
+        !supervised.contains_key(&1),
+        "the idle member's state was dropped"
+    );
+    assert!(
+        supervised.contains_key(&2),
+        "the member inside its window is kept"
+    );
+}
