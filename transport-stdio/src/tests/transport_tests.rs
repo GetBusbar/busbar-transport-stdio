@@ -46,3 +46,25 @@ fn a_compacted_buffer_gives_back_what_a_large_line_grew_it_to() {
         c.inbound.capacity()
     );
 }
+
+/// An op that took a connection out of the table before its shut, and waited for its lock while
+/// the shut closed it, finds it gone as an op after the shut does: it never runs on the closed
+/// handle, so a failure there never books a clean shut as the program's end. RED (codeaudit
+/// 94ae3e3, stdio ST-C1 LOW): the late op locked the shut connection and ran on it.
+#[test]
+fn an_op_that_took_a_connection_before_its_shut_finds_it_gone() {
+    let carried = Carried::open(b"", &[], 0).unwrap();
+    let conn = Conn {
+        io: 7,
+        key: 3,
+        ..Conn::default()
+    };
+    lock(&carried.conns).insert(1, Arc::new(Mutex::new(conn)));
+    let taken = carried.conn(1).expect("the op takes the connection");
+    assert!(carried.forget(1).is_some(), "the shut takes it out");
+    assert!(carried.conn(1).is_none(), "an op after the shut finds none");
+    assert!(
+        live(&taken).is_none(),
+        "the op that took it before the shut finds it gone"
+    );
+}
