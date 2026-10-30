@@ -238,6 +238,12 @@ impl Carried {
         lock(&self.conns).get(&token).cloned()
     }
 
+    /// The connection `token`, taken out of the table for its shut: every later op finds no such
+    /// connection.
+    fn forget(&self, token: u64) -> Option<Arc<Mutex<Conn>>> {
+        lock(&self.conns).remove(&token)
+    }
+
     /// The member `key`'s program ended at `now`: counted once per connection.
     /// An end met while the host's clock does not answer stays uncounted, so the
     /// connection's shut counts it.
@@ -300,6 +306,11 @@ fn refusal(e: &IoFailure) -> Refusal {
     }
 }
 
+/// The connection an op took out of the table, locked.
+fn live(conn: &Mutex<Conn>) -> Option<MutexGuard<'_, Conn>> {
+    Some(lock(conn))
+}
+
 /// Run `body` over the instance, its I/O and the connection `conn`, failing the op without one.
 macro_rules! over {
     ($op:literal, $inst:expr, $o:expr, $conn:expr, |$carried:ident, $io:ident, $c:ident| $body:block) => {{
@@ -310,7 +321,9 @@ macro_rules! over {
         let Some(conn) = $carried.conn($conn) else {
             return $o.fail(Refusal::failed(concat!($op, ": no such connection")));
         };
-        let mut $c = lock(&conn);
+        let Some(mut $c) = live(&conn) else {
+            return $o.fail(Refusal::failed(concat!($op, ": no such connection")));
+        };
         $body
     }};
 }
@@ -639,8 +652,7 @@ impl SafeSlot for Shut {
             Ok(x) => x,
             Err(r) => return o.fail(r),
         };
-        let gone = lock(&c.conns).remove(&i.conn);
-        if let Some(held) = gone {
+        if let Some(held) = c.forget(i.conn) {
             let mut conn = lock(&held);
             // A member's program found ENDED at its shut (the host's lease found it exited) is an
             // end, as is one whose op failed on its side; one still running (its output PENDING)
