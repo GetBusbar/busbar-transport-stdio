@@ -41,7 +41,8 @@ use busbar_contract::abi::mechanism::call::{OutHead, Outcome};
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::io::{Io, IoFailure};
-use busbar_contract::abi::sdk::life::{settings_object, Held, Life, Refreshed, Refusal};
+use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
+use busbar_contract::abi::sdk::transport::{carried, settings_reading};
 use busbar_contract::abi::sdk::{Instance, Lent, Out, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
@@ -80,13 +81,7 @@ pub const NOT_A_COUNT: &str =
 /// The line ceiling `settings` states: its [`BODY_MAX_BYTES`], or [`MAX_LINE_BYTES`] when it states
 /// none.
 fn ceiling(settings: &[u8]) -> Result<usize, Refusal> {
-    let object = settings_object(settings)?;
-    if let Some(key) = object.keys().find(|k| k.as_str() != BODY_MAX_BYTES) {
-        return Err(Refusal::failed(format!(
-            "settings: {key} is not a setting this transport reads"
-        )));
-    }
-    match object.get(BODY_MAX_BYTES) {
+    match settings_reading(settings, &[BODY_MAX_BYTES])?.get(BODY_MAX_BYTES) {
         None => Ok(MAX_LINE_BYTES),
         Some(v) => v
             .as_u64()
@@ -286,30 +281,14 @@ fn now(i: &Instance<'_, State>) -> Option<u64> {
     services.clock_now(handle).ok().map(|r| r.mono_ns)
 }
 
-/// The open instance and the host's I/O for this op, or the refusal a call on none earns. Both
-/// texts are static, so they are answered with no instance to keep them.
-fn carried_with<'a>(
-    i: &Instance<'a, State>,
-    no_instance: &'static str,
-    no_io: &'static str,
-) -> Result<(&'a Carried, Io<'a>), Refusal> {
-    let held = i.get().ok_or_else(|| Refusal::failed(no_instance))?;
-    let io = held
-        .host()
-        .map(|h| h.io(i.ticket()))
-        .filter(Io::armed)
-        .ok_or_else(|| Refusal::failed(no_io))?;
-    Ok((held.life(), io))
-}
-
-/// [`carried_with`] for the op named by the literal `$op`.
+/// The SDK's [`carried`] for the op named by the literal `$op`, its no-instance refusal static: with
+/// no instance there is nothing to keep an owned text.
 macro_rules! carried {
     ($inst:expr, $op:literal) => {
-        carried_with(
-            &$inst,
-            concat!($op, ": no open instance"),
-            concat!($op, ": the host lent this carrier no I/O"),
-        )
+        match $inst.get() {
+            None => Err(Refusal::failed(concat!($op, ": no open instance"))),
+            Some(_) => carried(&$inst, $op),
+        }
     };
 }
 
@@ -429,27 +408,8 @@ impl Conn {
     }
 }
 
-/// Declares the slot of a role this carrier does not play (every framer op; `listen` and
-/// `accept`: a stdio carrier listens on nothing): REFUSED, with that op's own static text.
-macro_rules! refused {
-    ($($(#[$doc:meta])* $name:ident($in:ty => $out:ty) $op:literal;)*) => {$(
-        $(#[$doc])*
-        pub struct $name;
-        impl SafeSlot for $name {
-            type In = $in;
-            type Out = $out;
-            type State = State;
-            fn call(_: Instance<'_, State>, _: Lent<'_, $in>, mut o: Out<'_, $out>) -> Outcome {
-                o.fail(Refusal::refused(concat!(
-                    $op,
-                    ": the stdio carrier does not serve this op"
-                )))
-            }
-        }
-    )*};
-}
-
-refused! {
+busbar_contract::not_served! {
+    state: State, role: "stdio carrier";
     /// `listen`: a stdio carrier listens on nothing.
     Listen(ListenIn => ListenOut) "listen";
     /// `accept`: nothing is listened on.
@@ -495,8 +455,6 @@ impl SafeSlot for Dial {
             Ok(x) => x,
             Err(r) => return o.fail(r),
         };
-        // THE SUPERVISOR: a member's program is spawned only when its policy lets it restart, on
-        // the host's clock; a member with no clock to be supervised by is not run unsupervised.
         let key = i.supervision_key;
         let at = if key == 0 {
             None
@@ -612,7 +570,6 @@ impl SafeSlot for Write {
         let bytes = i.bytes();
         let end = i.flags & WRITE_END_OF_FRAME != 0;
         over!("write", inst, o, i.conn, |carried, io, c| {
-            // What the pipe has not taken goes first; past the cap, nothing more is taken.
             match c.drain(&mut io) {
                 Poll::Ready(Err(e)) => {
                     carried.faulted(&mut c, now(&inst));
@@ -623,15 +580,12 @@ impl SafeSlot for Write {
                 }
                 _ => {}
             }
-            // A frame is bounded as a line is: past the ceiling it fails, never gathered.
             if c.message.len() + bytes.len() > carried.ceiling() {
                 emptied(&mut c.message);
                 return o.fail(Refusal::failed(FRAME_TOO_LONG));
             }
             c.message.extend_from_slice(bytes);
             if end {
-                // The frame is checked and queued in place; its buffer is kept for the next one,
-                // up to [`KEEP_BYTES`].
                 let c = &mut *c;
                 let one_line = !c.message.contains(&b'\n') && c.message.last() != Some(&b'\r');
                 if one_line {
