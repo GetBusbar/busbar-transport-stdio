@@ -181,6 +181,8 @@ struct Conn {
     line: Option<Line>,
     /// The program's output ended.
     ended: bool,
+    /// The connection was shut: its handle is closed and it is out of the table.
+    shut: bool,
     /// The frame being written, gathered until its end.
     message: Vec<u8>,
     /// Bytes owed to the program, from `sent` on.
@@ -238,10 +240,13 @@ impl Carried {
         lock(&self.conns).get(&token).cloned()
     }
 
-    /// The connection `token`, taken out of the table for its shut: every later op finds no such
-    /// connection.
+    /// The connection `token`, taken out of the table for its shut and marked shut under its lock:
+    /// every later op finds no such connection, and so does an op that took it out of the table
+    /// before and waits for its lock.
     fn forget(&self, token: u64) -> Option<Arc<Mutex<Conn>>> {
-        lock(&self.conns).remove(&token)
+        let held = lock(&self.conns).remove(&token)?;
+        lock(&held).shut = true;
+        Some(held)
     }
 
     /// The member `key`'s program ended at `now`: counted once per connection.
@@ -306,9 +311,11 @@ fn refusal(e: &IoFailure) -> Refusal {
     }
 }
 
-/// The connection an op took out of the table, locked.
+/// The connection an op took out of the table, locked; `None` when it was shut while the op waited
+/// for its lock (the op never runs on the closed handle).
 fn live(conn: &Mutex<Conn>) -> Option<MutexGuard<'_, Conn>> {
-    Some(lock(conn))
+    let c = lock(conn);
+    (!c.shut).then_some(c)
 }
 
 /// Run `body` over the instance, its I/O and the connection `conn`, failing the op without one.
