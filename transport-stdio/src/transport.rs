@@ -58,7 +58,8 @@ use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
 pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 
 /// The line ceiling when the host hands no [`BODY_MAX_BYTES`]: the host's own default request-body
-/// bound (32 MiB), the default the tail declares for the setting.
+/// bound (32 MiB). The tail declares it as the SDK's `DEFAULT_BODY_MAX`, which the SDK asserts at
+/// compile time is this same count.
 pub const MAX_LINE_BYTES: usize = DEFAULT_REQUEST_BODY_MAX_BYTES;
 
 /// The queued bytes past which a `write` takes nothing more and waits for the pipe to drain. It
@@ -181,6 +182,8 @@ struct Conn {
     line: Option<Line>,
     /// The program's output ended.
     ended: bool,
+    /// The connection was shut: its handle is closed and it is out of the table.
+    shut: bool,
     /// The frame being written, gathered until its end.
     message: Vec<u8>,
     /// Bytes owed to the program, from `sent` on.
@@ -238,6 +241,15 @@ impl Carried {
         lock(&self.conns).get(&token).cloned()
     }
 
+    /// The connection `token`, taken out of the table for its shut and marked shut under its lock:
+    /// every later op finds no such connection, and so does an op that took it out of the table
+    /// before and waits for its lock.
+    fn forget(&self, token: u64) -> Option<Arc<Mutex<Conn>>> {
+        let held = lock(&self.conns).remove(&token)?;
+        lock(&held).shut = true;
+        Some(held)
+    }
+
     /// The member `key`'s program ended at `now`: counted once per connection.
     /// An end met while the host's clock does not answer stays uncounted, so the
     /// connection's shut counts it.
@@ -261,6 +273,15 @@ impl Carried {
     fn faulted(&self, c: &mut Conn, now: Option<u64>) {
         c.faulted = true;
         self.ended(c, now);
+    }
+
+    /// Whether the member `key`'s program is held down at `at`. A key whose state holds nothing
+    /// reads as a fresh one: dropped, so the map holds only members inside their window and members
+    /// held down until declared anew.
+    fn held_down(&self, key: u64, at: u64) -> bool {
+        let mut supervised = lock(&self.supervised);
+        supervised.retain(|_, s| !s.idle(at));
+        supervised.get(&key).is_some_and(|s| !s.may_restart(at))
     }
 
     /// The line ceiling now.
@@ -300,6 +321,13 @@ fn refusal(e: &IoFailure) -> Refusal {
     }
 }
 
+/// The connection an op took out of the table, locked; `None` when it was shut while the op waited
+/// for its lock (the op never runs on the closed handle).
+fn live(conn: &Mutex<Conn>) -> Option<MutexGuard<'_, Conn>> {
+    let c = lock(conn);
+    (!c.shut).then_some(c)
+}
+
 /// Run `body` over the instance, its I/O and the connection `conn`, failing the op without one.
 macro_rules! over {
     ($op:literal, $inst:expr, $o:expr, $conn:expr, |$carried:ident, $io:ident, $c:ident| $body:block) => {{
@@ -310,7 +338,9 @@ macro_rules! over {
         let Some(conn) = $carried.conn($conn) else {
             return $o.fail(Refusal::failed(concat!($op, ": no such connection")));
         };
-        let mut $c = lock(&conn);
+        let Some(mut $c) = live(&conn) else {
+            return $o.fail(Refusal::failed(concat!($op, ": no such connection")));
+        };
         $body
     }};
 }
@@ -462,14 +492,7 @@ impl SafeSlot for Dial {
             let Some(at) = now(&inst) else {
                 return o.fail(Refusal::failed(NO_CLOCK));
             };
-            let held_down = {
-                let mut supervised = lock(&c.supervised);
-                // A key whose state holds nothing reads as a fresh one: dropped, so the map holds
-                // only members inside their window and members held down until declared anew.
-                supervised.retain(|_, s| !s.idle(at));
-                supervised.get(&key).is_some_and(|s| !s.may_restart(at))
-            };
-            if held_down {
+            if c.held_down(key, at) {
                 return o.fail(Refusal::refused(HELD_DOWN));
             }
             Some(at)
@@ -584,12 +607,21 @@ impl SafeSlot for Write {
                 emptied(&mut c.message);
                 return o.fail(Refusal::failed(FRAME_TOO_LONG));
             }
-            c.message.extend_from_slice(bytes);
-            if end {
+            if !end {
+                c.message.extend_from_slice(bytes);
+            } else {
                 let c = &mut *c;
-                let one_line = !c.message.contains(&b'\n') && c.message.last() != Some(&b'\r');
+                // A frame that arrives whole in one write is checked where it lies and queued
+                // straight to `outbound`, copied once; a gathered one is its gathered bytes.
+                let frame: &[u8] = if c.message.is_empty() {
+                    bytes
+                } else {
+                    c.message.extend_from_slice(bytes);
+                    &c.message
+                };
+                let one_line = !frame.contains(&b'\n') && frame.last() != Some(&b'\r');
                 if one_line {
-                    c.outbound.extend_from_slice(&c.message);
+                    c.outbound.extend_from_slice(frame);
                     c.outbound.push(b'\n');
                 }
                 emptied(&mut c.message);
@@ -639,8 +671,7 @@ impl SafeSlot for Shut {
             Ok(x) => x,
             Err(r) => return o.fail(r),
         };
-        let gone = lock(&c.conns).remove(&i.conn);
-        if let Some(held) = gone {
+        if let Some(held) = c.forget(i.conn) {
             let mut conn = lock(&held);
             // A member's program found ENDED at its shut (the host's lease found it exited) is an
             // end, as is one whose op failed on its side; one still running (its output PENDING)

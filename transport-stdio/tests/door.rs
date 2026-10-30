@@ -13,7 +13,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use busbar_contract::abi::host::io::{
     HandleIn, IoSlots, ReadIn as IoReadIn, SpawnIn, WriteIn as IoWriteIn, SLOTS,
@@ -23,6 +23,7 @@ use busbar_contract::abi::mechanism::call::{
     AbiStr, Blob, InHead, Op, OutHead, Outcome, RawOutcome, BLOB_JSON,
 };
 use busbar_contract::abi::mechanism::door::Door;
+use busbar_contract::abi::mechanism::extensions::declares;
 use busbar_contract::abi::mechanism::lifecycle::{
     slot as life, OpenIn, OpenOut, RefreshIn, ValidateIn,
 };
@@ -33,10 +34,10 @@ use busbar_contract::abi::transport::{
     Destination, DialIn, EmitIn, EncodeIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut,
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, TransportTail,
     WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME, ROLE_CARRIER, SETTING_COUNT,
-    WRITE_END_OF_FRAME,
+    UNIT0_FIRST_LINE, WRITE_END_OF_FRAME,
 };
 use busbar_transport_stdio::door::{
-    door, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, STATEMENT, TOO_LONG,
+    door, FRAME_TOO_LONG, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, STATEMENT, TOO_LONG,
 };
 
 fn z<T>() -> T {
@@ -180,7 +181,10 @@ static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);
 static ONE: Mutex<()> = Mutex::new(());
 
 fn with<R>(f: impl FnOnce(&mut Script) -> R) -> R {
-    f(SCRIPT.lock().unwrap().get_or_insert_with(Script::default))
+    f(SCRIPT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(Script::default))
 }
 
 fn answer(out: *mut ServiceOut, o: Outcome, value: u64, len: u64) -> RawOutcome {
@@ -277,7 +281,7 @@ impl Host {
 
     /// The carrier opened with the settings blob `json`, its program dialed.
     fn with_settings(json: Option<&str>, reads: Vec<Option<Vec<u8>>>) -> Self {
-        *SCRIPT.lock().unwrap() = Some(Script {
+        *SCRIPT.lock().unwrap_or_else(PoisonError::into_inner) = Some(Script {
             reads,
             ..Script::default()
         });
@@ -389,9 +393,38 @@ fn the_tail_is_a_carrier_composing_over_nothing() {
     assert_eq!(check_tail(tail), Ok(()));
 }
 
+/// The claim row states the facts the root reads for a stdio session: a session, bound to its
+/// principal, whose first unit opens on its first line, and no selector forms; and the linked
+/// entry's `SESSION` says the same.
+#[test]
+fn the_claim_row_states_a_line_session_and_the_linked_entry_agrees() {
+    // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
+    let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
+    assert_eq!(tail.claim_rows_len, 1, "one claim row: stdio");
+    // SAFETY: the tail's own `'static` list, `claim_rows_len` long.
+    let claim = unsafe { &*tail.claim_rows };
+    assert_eq!(claim.session, 1, "it carries sessions");
+    assert_eq!(claim.session_bound, 1, "a session caches its principal");
+    assert_eq!(
+        claim.unit0_trigger, UNIT0_FIRST_LINE,
+        "the first unit opens on its first line"
+    );
+    assert_eq!(text(claim.selector_forms), "", "no selector forms");
+    assert_eq!(
+        text(claim.egress_selector_forms),
+        "",
+        "no outbound selector forms"
+    );
+    assert_eq!(
+        busbar_transport_stdio::linked::SESSION,
+        claim.session == 1,
+        "linked::SESSION agrees with the claim row"
+    );
+}
+
 #[test]
 fn a_dial_spawns_exactly_the_program_it_is_lent() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let _h = Host::new(Vec::new());
     with(|sc| {
         assert_eq!(
@@ -403,7 +436,7 @@ fn a_dial_spawns_exactly_the_program_it_is_lent() {
 
 #[test]
 fn each_line_is_one_frame_whatever_the_reads_cut() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(vec![
         Some(b"{\"a\":".to_vec()),
         None,
@@ -444,7 +477,7 @@ fn each_line_is_one_frame_whatever_the_reads_cut() {
 
 #[test]
 fn a_line_past_the_ceiling_fails_the_read() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let long = vec![b'x'; MAX_LINE_BYTES + 1];
     let mut reads: Vec<Option<Vec<u8>>> =
         long.chunks(16 * 1024).map(|c| Some(c.to_vec())).collect();
@@ -456,7 +489,7 @@ fn a_line_past_the_ceiling_fails_the_read() {
 
 #[test]
 fn a_frame_goes_out_as_one_line_and_one_that_cannot_be_one_is_refused() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     assert_eq!(h.write(b"{\"id\":", false).0, Outcome::Ready);
     with(|sc| {
@@ -491,9 +524,30 @@ fn a_frame_goes_out_as_one_line_and_one_that_cannot_be_one_is_refused() {
     );
 }
 
+/// A frame refused while it was gathered (it holds a newline, or it ran past the ceiling) leaves
+/// nothing gathered: the next good frame goes out as its own line, no refused byte before it.
+#[test]
+fn a_refused_frame_leaves_nothing_gathered_for_the_next() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::with_settings(Some(&body_max(64)), Vec::new());
+    assert_eq!(h.write(b"two\n", false).0, Outcome::Ready);
+    assert_eq!(
+        h.write(b"lines", true),
+        (Outcome::Failed, NOT_ONE_LINE.to_owned())
+    );
+    assert_eq!(h.write(b"first", true).0, Outcome::Ready);
+    assert_eq!(h.write(&[b'x'; 40], false).0, Outcome::Ready);
+    assert_eq!(
+        h.write(&[b'y'; 40], false),
+        (Outcome::Failed, FRAME_TOO_LONG.to_owned())
+    );
+    assert_eq!(h.write(b"second", true).0, Outcome::Ready);
+    with(|sc| assert_eq!(sc.written, b"first\nsecond\n"));
+}
+
 #[test]
 fn shut_closes_the_program_and_an_authority_or_a_listen_is_refused() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     let mut i: ShutIn = z();
     i.conn = h.conn;
@@ -532,7 +586,7 @@ fn shut_closes_the_program_and_an_authority_or_a_listen_is_refused() {
 /// buffer per frame.
 #[test]
 fn a_buffered_line_and_a_whole_frame_allocate_nothing() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(vec![
         Some(b"the first line, which warms the buffer\n{\"id\":2}\nthird\n".to_vec()),
         None,
@@ -561,7 +615,7 @@ fn a_buffered_line_and_a_whole_frame_allocate_nothing() {
 /// stdio program's large message (a long tool list, a resource read carrying base64) is read whole.
 #[test]
 fn a_line_of_a_hundred_kib_is_one_frame() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let mut line = vec![b'x'; 100 * 1024];
     line.push(b'\n');
     let mut reads: Vec<Option<Vec<u8>>> =
@@ -584,7 +638,7 @@ fn a_line_of_a_hundred_kib_is_one_frame() {
 /// RED (row 159, stdio NIT): this one was REFUSED while the newline's FAILED.
 #[test]
 fn a_gathered_frame_past_the_line_ceiling_fails() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     let chunk = vec![b'x'; 1024 * 1024];
     let mut answered = Outcome::Ready;
@@ -618,7 +672,7 @@ fn the_tail_declares_the_request_body_bound_it_reads() {
 /// MEDIUM M2): the ceiling was a fixed 32 MiB whatever the deployment set.
 #[test]
 fn the_line_ceiling_is_the_deployments_request_body_bound() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let mut out = vec![b'a'; 64];
     out.push(b'\n');
     out.extend_from_slice(&[b'b'; 65]);
@@ -644,7 +698,7 @@ fn the_line_ceiling_is_the_deployments_request_body_bound() {
 /// RED (row 159, stdio MEDIUM M2): a line the deployment's bound admits failed the read.
 #[test]
 fn a_raised_request_body_bound_carries_a_line_past_the_default() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let mut line = vec![b'x'; MAX_LINE_BYTES + 1];
     line.push(b'\n');
     let mut reads: Vec<Option<Vec<u8>>> =
@@ -663,7 +717,7 @@ fn a_raised_request_body_bound_carries_a_line_past_the_default() {
 /// stdio MEDIUM M2).
 #[test]
 fn a_refresh_moves_the_line_ceiling() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     assert_eq!(h.refresh(&body_max(64)), Outcome::Ready);
     assert_eq!(
@@ -702,7 +756,7 @@ fn a_request_body_bound_that_is_no_count_fails_validation() {
 /// connection (not a clean end, not a taken frame).
 #[test]
 fn a_read_or_write_on_a_shut_connection_fails() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     let mut i: ShutIn = z();
     i.conn = h.conn;
@@ -728,7 +782,7 @@ fn a_read_or_write_on_a_shut_connection_fails() {
 /// `arrival` answers READY for a live connection and FAILS for one the carrier never made.
 #[test]
 fn arrival_answers_for_a_live_connection_only() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     let mut peer = [0_u8; 16];
     let mut arrival = |conn: u64| {
@@ -748,7 +802,7 @@ fn arrival_answers_for_a_live_connection_only() {
 /// stdio LOW): the read failed when the CR and the LF came in separate reads.
 #[test]
 fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let line = vec![b'x'; MAX_LINE_BYTES];
     let mut reads: Vec<Option<Vec<u8>>> =
         line.chunks(16 * 1024).map(|c| Some(c.to_vec())).collect();
@@ -772,7 +826,7 @@ fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
 /// everything, so a slow reader's queue grew by every byte written.
 #[test]
 fn a_program_that_reads_slower_than_frames_arrive_holds_a_bounded_queue() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     const FRAME: usize = 1000;
     const WARM: usize = 3000;
     const WINDOW: usize = 6000;
@@ -860,7 +914,7 @@ fn settings_refuse_undeclared_keys_zero_and_bad_counts_with_the_canonical_texts(
 
 #[test]
 fn open_and_refresh_refuse_undeclared_keys() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     assert_eq!(h.refresh("{\"nope\":true}"), Outcome::Failed);
     assert_eq!(
@@ -885,7 +939,7 @@ fn open_and_refresh_refuse_undeclared_keys() {
 /// Each role stub answers REFUSED with its own op's text.
 #[test]
 fn every_role_stub_is_refused_with_its_own_op_text() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     macro_rules! stub {
         ($field:ident, $idx:ident, $in:ty, $out:ty, $name:literal) => {{
@@ -938,7 +992,7 @@ fn line_failure_texts_carry_the_op_prefix() {
     assert!(TOO_LONG.starts_with("read: "), "{TOO_LONG}");
     assert!(busbar_transport_stdio::door::FRAME_TOO_LONG.starts_with("write: "));
     assert!(NOT_ONE_LINE.starts_with("write: "));
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     let mut i: ConnIn = z();
     i.conn = h.conn + 99;
@@ -953,7 +1007,7 @@ fn line_failure_texts_carry_the_op_prefix() {
 /// Instance close closes every connection handle still held (the program is killed with it).
 #[test]
 fn instance_close_closes_every_held_connection() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
     with(|sc| assert!(sc.closed.is_empty()));
     let mut i: InHead = z();
@@ -967,6 +1021,12 @@ fn instance_close_closes_every_held_connection() {
 
 #[test]
 fn the_statement_carries_the_declares_document() {
-    let declared = STATEMENT.extensions.len;
-    assert_ne!(declared, 0, "declares.json rides the Statement");
+    let ext = STATEMENT.extensions;
+    // SAFETY: the Statement's own `'static` extensions blob, `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ext.ptr, ext.len) };
+    assert_eq!(
+        declares(bytes),
+        Some(&include_bytes!("../declares.json")[..]),
+        "declares.json rides the Statement, whole, under its key"
+    );
 }
