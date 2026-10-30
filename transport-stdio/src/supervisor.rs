@@ -3,8 +3,9 @@
 
 //! The stdio supervisor: the restart policy of a program that keeps ending. A circuit breaker, not a
 //! retry loop: each end is timed on the host's one clock (monotonic, `clock.now`); the next spawn
-//! waits a backoff doubling from [`BASE_BACKOFF_NS`] to [`MAX_BACKOFF_NS`], and [`CRASH_THRESHOLD`]
-//! ends inside [`CRASH_WINDOW_NS`] stop the restarts until the member is declared anew.
+//! waits a backoff that starts at [`BASE_BACKOFF_NS`] and doubles with each end inside
+//! [`CRASH_WINDOW_NS`] (100, 200, 400, 800 ms), and the [`CRASH_THRESHOLD`]th end inside the window
+//! stops the restarts until the member is declared anew. The trip, not a ceiling, ends the doubling.
 //!
 //! One supervisor per SUPERVISION KEY (`DialIn::supervision_key`): the host mints a key for each
 //! member and keeps it while the member's program is unchanged across re-declarations, so the
@@ -16,8 +17,6 @@ const MS: u64 = 1_000_000;
 
 /// The first restart's backoff after a program ended.
 pub const BASE_BACKOFF_NS: u64 = 100 * MS;
-/// The ceiling the doubling backoff stops at.
-pub const MAX_BACKOFF_NS: u64 = 30_000 * MS;
 /// How many ends inside [`CRASH_WINDOW_NS`] stop the restarts.
 pub const CRASH_THRESHOLD: usize = 5;
 /// The window the ends are counted over.
@@ -44,12 +43,8 @@ impl Supervisor {
             self.tripped = true;
             return;
         }
-        let shift = u32::try_from(self.crashes.len().saturating_sub(1))
-            .unwrap_or(u32::MAX)
-            .min(20);
-        let backoff = BASE_BACKOFF_NS
-            .saturating_mul(1_u64 << shift)
-            .min(MAX_BACKOFF_NS);
+        // Short of the trip the window holds 1 to CRASH_THRESHOLD - 1 ends: at most 3 doublings.
+        let backoff = BASE_BACKOFF_NS << (self.crashes.len() - 1);
         self.restart_at = Some(now.saturating_add(backoff));
     }
 
