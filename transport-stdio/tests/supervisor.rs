@@ -23,9 +23,11 @@
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
-use busbar_contract::abi::host::io::{HandleIn, IoSlots, ReadIn as IoReadIn, SLOTS};
+use busbar_contract::abi::host::io::{
+    HandleIn, IoSlots, ReadIn as IoReadIn, WriteIn as IoWriteIn, SLOTS,
+};
 use busbar_contract::abi::host::service::{ClockNowIn, HostSlots, ServiceOut, SERVICES};
 use busbar_contract::abi::mechanism::call::{
     AbiStr, Field, InHead, Op, OutHead, Outcome, RawOutcome,
@@ -34,7 +36,8 @@ use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::transport::{
-    slot, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, DEST_PROGRAM,
+    slot, ConnIn, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, WriteIn, DEST_PROGRAM,
+    WRITE_END_OF_FRAME,
 };
 use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, TOO_LONG};
 
@@ -101,6 +104,10 @@ struct Script {
     /// Full reads of output (`x`, as many bytes as the carrier lends) answered before the read
     /// that finds the program ended or running.
     flood: usize,
+    /// Whether a pipe write FAILS (the program's stdin is broken: EPIPE).
+    write_fails: bool,
+    /// Whether a pipe write answers PENDING (the program reads nothing yet).
+    write_pends: bool,
 }
 
 static SCRIPT: Mutex<Script> = Mutex::new(Script {
@@ -113,11 +120,13 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     spawns: 0,
     clock_fails: false,
     flood: 0,
+    write_fails: false,
+    write_pends: false,
 });
 static ONE: Mutex<()> = Mutex::new(());
 
 fn with<R>(f: impl FnOnce(&mut Script) -> R) -> R {
-    f(&mut SCRIPT.lock().unwrap())
+    f(&mut SCRIPT.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 fn answer(out: *mut ServiceOut, o: Outcome, value: u64, len: u64) -> RawOutcome {
@@ -163,6 +172,19 @@ extern "C" fn io_read(_: HostCtx, input: *const c_void, out: *mut ServiceOut) ->
     }
 }
 
+extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    // SAFETY: the carrier's `in`.
+    let i = unsafe { input.cast::<IoWriteIn>().read() };
+    let (fails, pends) = with(|sc| (sc.write_fails, sc.write_pends));
+    if fails {
+        answer(out, Outcome::Failed, 0, 0)
+    } else if pends {
+        answer(out, Outcome::Pending, 0, 0)
+    } else {
+        answer(out, Outcome::Ready, 0, i.len as u64)
+    }
+}
+
 extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
     let _ = unsafe { input.cast::<HandleIn>().read() };
@@ -189,7 +211,7 @@ static IO: IoSlots = IoSlots {
     listen: None,
     accept: None,
     read: Some(io_read),
-    write: None,
+    write: Some(io_write),
     ready: None,
     shut: None,
     close: Some(io_close),
@@ -216,7 +238,7 @@ struct Carrier {
 
 impl Carrier {
     fn open() -> Self {
-        *SCRIPT.lock().unwrap() = Script {
+        *SCRIPT.lock().unwrap_or_else(PoisonError::into_inner) = Script {
             mono_ns: 1_000 * MS,
             spawn_fails: false,
             spawn_refused: false,
@@ -226,6 +248,8 @@ impl Carrier {
             spawns: 0,
             clock_fails: false,
             flood: 0,
+            write_fails: false,
+            write_pends: false,
         };
         let tables = Box::new(HostTables {
             size: size_of::<HostTables>() as u32,
@@ -322,6 +346,25 @@ impl Carrier {
         );
     }
 
+    /// Write one whole frame to `conn`.
+    fn write_frame(&self, conn: u64, bytes: &[u8]) -> Outcome {
+        let mut i: WriteIn = z();
+        i.conn = conn;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.flags = WRITE_END_OF_FRAME;
+        let mut o: IoOut = z();
+        call(ops().write, self.inst, &mut i, &mut o, slot::WRITE)
+    }
+
+    /// Flush `conn`.
+    fn flush(&self, conn: u64) -> Outcome {
+        let mut i: ConnIn = z();
+        i.conn = conn;
+        let mut o: OutHead = z();
+        call(ops().flush, self.inst, &mut i, &mut o, slot::FLUSH)
+    }
+
     fn shut(&self, conn: u64) {
         let mut i: ShutIn = z();
         i.conn = conn;
@@ -361,7 +404,7 @@ fn advance(ns: u64) {
 /// restarts for good (an hour later it is still refused).
 #[test]
 fn a_program_that_keeps_ending_is_held_down_then_stopped() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     c.run_to_end(1, "a");
     c.assert_held_down(1, "a", "held down inside the backoff");
@@ -382,7 +425,7 @@ fn a_program_that_keeps_ending_is_held_down_then_stopped() {
 /// A spawn that fails is counted like any end.
 #[test]
 fn a_spawn_that_fails_counts_as_an_end() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     with(|sc| sc.spawn_fails = true);
     assert_eq!(
@@ -400,20 +443,23 @@ fn a_spawn_that_fails_counts_as_an_end() {
 }
 
 /// A spawn the host's POLICY refuses answers REFUSED, not FAILED: the host's refusal is not a
-/// system failure.
+/// system failure. Like any spawn that fails it is counted as an end of the member's program
+/// (the policy repeats on every attempt): the next dial is held down.
 #[test]
 fn a_spawn_the_host_refuses_is_refused() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     with(|sc| sc.spawn_refused = true);
     assert_eq!(c.dial(3, "a").0, Outcome::Refused);
+    with(|sc| sc.spawn_refused = false);
+    c.assert_held_down(3, "a", "the refused spawn was counted as an end");
 }
 
 /// A read the pipe fails (the host answers a failure, not a line past the ceiling) is an END of
 /// the program: counted then, so the shut of the connection does not read it as clean.
 #[test]
 fn a_failed_pipe_read_is_an_end() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     let (r, conn) = c.dial(4, "a");
     assert_eq!(r, Outcome::Ready);
@@ -423,6 +469,7 @@ fn a_failed_pipe_read_is_an_end() {
     });
     assert_eq!(c.read(conn), Outcome::Failed);
     with(|sc| sc.read_fails = false);
+    c.assert_held_down(4, "a", "counted at the failed read, before the shut");
     c.shut(conn);
     let (r, _, why) = c.dial_why(4, "a");
     assert_eq!(r, Outcome::Refused, "held down after the failed read");
@@ -432,10 +479,53 @@ fn a_failed_pipe_read_is_an_end() {
     );
 }
 
+/// A write the pipe fails (a program that died breaks its stdin: EPIPE) is an END of the program,
+/// counted at the write: a dial before the connection is shut is already held down.
+#[test]
+fn a_failed_pipe_write_is_an_end() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(5, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.write_fails = true;
+    });
+    assert_eq!(c.write_frame(conn, b"{}"), Outcome::Failed);
+    c.assert_held_down(5, "a", "counted at the failed write, before the shut");
+    with(|sc| sc.write_fails = false);
+    c.shut(conn);
+    c.assert_held_down(5, "a", "still held down after the shut");
+}
+
+/// A flush the pipe fails (the frame was queued while the program read nothing, then its stdin
+/// broke) is an END of the program, counted at the flush.
+#[test]
+fn a_failed_flush_is_an_end() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(6, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.write_pends = true;
+    });
+    assert_eq!(c.write_frame(conn, b"{}"), Outcome::Ready, "queued");
+    with(|sc| {
+        sc.write_pends = false;
+        sc.write_fails = true;
+    });
+    assert_eq!(c.flush(conn), Outcome::Failed);
+    c.assert_held_down(6, "a", "counted at the failed flush, before the shut");
+    with(|sc| sc.write_fails = false);
+    c.shut(conn);
+    c.assert_held_down(6, "a", "still held down after the shut");
+}
+
 /// (i) Two members running one identical program trip independently.
 #[test]
 fn two_members_running_one_program_trip_independently() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     c.trip(10, "a");
     c.assert_held_down(10, "a", "the first member tripped");
@@ -449,7 +539,7 @@ fn two_members_running_one_program_trip_independently() {
 /// (ii) A member dropped and re-added is a new member: a new key, fresh supervision.
 #[test]
 fn a_member_dropped_and_re_added_is_fresh() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     c.trip(20, "a");
     c.assert_held_down(20, "a", "the tripped member");
@@ -463,7 +553,7 @@ fn a_member_dropped_and_re_added_is_fresh() {
 /// (iii) A rotated secret value under an unchanged member does NOT reset a trip.
 #[test]
 fn a_rotated_secret_value_does_not_reset_a_trip() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     c.trip(30, "old-secret");
     c.assert_held_down(
@@ -476,7 +566,7 @@ fn a_rotated_secret_value_does_not_reset_a_trip() {
 /// A clean shut of a running program is not an end: shut ten times over, it still dials at once.
 #[test]
 fn a_clean_shut_of_a_running_program_is_not_an_end() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     with(|sc| sc.ended = false);
     for _ in 0..10 {
@@ -489,7 +579,7 @@ fn a_clean_shut_of_a_running_program_is_not_an_end() {
 /// A program found ended when it is shut (the host's lease found it exited) is an end.
 #[test]
 fn a_program_found_ended_at_its_shut_is_an_end() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     let (r, conn) = c.dial(50, "a");
     assert_eq!(r, Outcome::Ready);
@@ -501,7 +591,7 @@ fn a_program_found_ended_at_its_shut_is_an_end() {
 /// A key of `0` names no member (a one-shot program line): it is not supervised.
 #[test]
 fn a_program_no_member_runs_is_not_supervised() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     for _ in 0..8 {
         c.run_to_end(0, "a");
@@ -515,7 +605,7 @@ fn a_program_no_member_runs_is_not_supervised() {
 /// no clock.
 #[test]
 fn a_member_is_not_run_when_the_clock_does_not_answer() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     with(|sc| sc.clock_fails = true);
     let before = with(|sc| sc.spawns);
@@ -531,7 +621,7 @@ fn a_member_is_not_run_when_the_clock_does_not_answer() {
 /// counted without being counted.
 #[test]
 fn an_end_met_without_a_clock_is_counted_once_the_clock_answers() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     let (r, conn) = c.dial(60, "a");
     assert_eq!(r, Outcome::Ready);
@@ -558,7 +648,7 @@ fn past_the_ceiling() -> usize {
 /// and never held down.
 #[test]
 fn a_line_past_the_ceiling_is_an_end() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     let (r, conn) = c.dial(70, "a");
     assert_eq!(r, Outcome::Ready);
@@ -571,6 +661,7 @@ fn a_line_past_the_ceiling_is_an_end() {
         (Outcome::Failed, TOO_LONG.to_owned()),
         "the line ran past the ceiling"
     );
+    c.assert_held_down(70, "a", "counted at the failed read, before the shut");
     c.shut(conn);
     c.assert_held_down(70, "a", "held down after the read the program failed");
 }
@@ -579,7 +670,7 @@ fn a_line_past_the_ceiling_is_an_end() {
 /// (here, at the shut of the still-running program). RED (row 159, stdio MEDIUM M1).
 #[test]
 fn a_line_past_the_ceiling_met_without_a_clock_is_counted_at_the_shut() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     let (r, conn) = c.dial(71, "a");
     assert_eq!(r, Outcome::Ready);
@@ -600,7 +691,7 @@ fn a_line_past_the_ceiling_met_without_a_clock_is_counted_at_the_shut() {
 /// probe stopped after exactly 1 MiB, one read before the end, and read the program as running.
 #[test]
 fn a_program_that_exited_behind_a_full_pipe_is_found_ended_at_its_shut() {
-    let _one = ONE.lock().unwrap();
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     let (r, conn) = c.dial(80, "a");
     assert_eq!(r, Outcome::Ready);
