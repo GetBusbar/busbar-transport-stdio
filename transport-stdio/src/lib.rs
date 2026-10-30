@@ -32,6 +32,6 @@ pub mod linked {
     /// The layers this transport declares it can be built over: none, it is the bottom of its stack.
     pub const COMPOSES_OVER: &[&str] = &[];
     /// Whether this transport carries sessions.
-    pub const SESSION: bool = true;
+    pub const SESSION: bool = crate::meta::SESSION;
     pub use crate::door::{door, MACRO_DOOR};
 }

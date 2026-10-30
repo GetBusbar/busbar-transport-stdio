@@ -223,8 +223,7 @@ impl Life for Carried {
     /// READY and drops the state.
     fn close(&self, host: Option<&Host>) {
         let conns: Vec<_> = lock(&self.conns).drain().map(|(_, c)| c).collect();
-        if let Some(host) = host {
-            let mut io = host.io(Ticket::NONE);
+        if let Some(mut io) = host.map(|h| h.io(Ticket::NONE)).filter(Io::armed) {
             for conn in conns {
                 let _ = io.close(lock(&conn).io);
             }
@@ -700,8 +699,10 @@ impl SafeSlot for Arrival {
         i: Lent<'_, ArrivalIn>,
         mut o: Out<'_, ArrivalOut>,
     ) -> Outcome {
-        let known = inst.get().is_some_and(|h| h.life().conn(i.conn).is_some());
-        if known {
+        let Some(h) = inst.get() else {
+            return o.fail(Refusal::failed("arrival: no open instance"));
+        };
+        if h.life().conn(i.conn).is_some() {
             Outcome::Ready
         } else {
             o.fail(Refusal::failed("arrival: no such connection"))
