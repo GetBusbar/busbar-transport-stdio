@@ -115,9 +115,12 @@ const PIPE_MAX_BYTES: usize = 1024 * 1024;
 /// that finds its end. Past it, the program is still writing: it is running.
 const SHUT_PROBE_READS: usize = PIPE_MAX_BYTES / READ_CHUNK + 1;
 
-/// Whether the program behind `handle` has ENDED: its remaining output read and discarded (the
-/// connection is being shut) until its end, an error, or PENDING (running).
+/// Check the parent process independently of inherited pipes, then use the pipe probe as a
+/// fallback for older hosts without process-exit reporting.
 fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
+    if matches!(io.program_exit(handle), Ok(Some(_))) {
+        return true;
+    }
     let mut chunk = [0_u8; READ_CHUNK];
     for _ in 0..SHUT_PROBE_READS {
         match io.read(handle, &mut chunk) {

@@ -95,6 +95,8 @@ struct Script {
     read_fails: bool,
     /// Whether a read finds the program ended (`true`) or running (`false`: PENDING).
     ended: bool,
+    /// The supervised parent exited, independently of a descendant holding its stdout pipe.
+    parent_exited: bool,
     /// The handle the next spawn answers.
     next_handle: u64,
     /// Spawns answered.
@@ -116,6 +118,7 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     spawn_refused: false,
     read_fails: false,
     ended: true,
+    parent_exited: false,
     next_handle: 1,
     spawns: 0,
     clock_fails: false,
@@ -191,6 +194,12 @@ extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
     answer(out, Outcome::Ready, 0, 0)
 }
 
+extern "C" fn io_ends(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    // SAFETY: the caller lends its ServiceOut for this service crossing.
+    unsafe { (*out).exited = u8::from(with(|sc| sc.parent_exited)) };
+    answer(out, Outcome::Ready, 0, 0)
+}
+
 extern "C" fn clock_now(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     if with(|sc| sc.clock_fails) {
         return answer(out, Outcome::Failed, 0, 0);
@@ -216,7 +225,7 @@ static IO: IoSlots = IoSlots {
     shut: None,
     close: Some(io_close),
     spawn: Some(io_spawn),
-    ends: None,
+    ends: Some(io_ends),
 };
 
 fn services() -> &'static HostSlots {
@@ -244,6 +253,7 @@ impl Carrier {
             spawn_refused: false,
             read_fails: false,
             ended: true,
+            parent_exited: false,
             next_handle: 1,
             spawns: 0,
             clock_fails: false,
@@ -586,6 +596,24 @@ fn a_program_found_ended_at_its_shut_is_an_end() {
     with(|sc| sc.ended = true);
     c.shut(conn);
     c.assert_held_down(50, "a", "its end was counted at the shut");
+}
+
+#[test]
+fn an_exited_parent_is_supervised_while_a_descendant_keeps_stdout_open() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    with(|sc| sc.ended = false);
+    for backoff in [100, 200, 400, 800, 0] {
+        with(|sc| sc.parent_exited = false);
+        let (outcome, conn) = c.dial(51, "a");
+        assert_eq!(outcome, Outcome::Ready, "the previous backoff has elapsed");
+        with(|sc| sc.parent_exited = true);
+        c.shut(conn);
+        c.assert_held_down(51, "a", "parent exit counts even while stdout is Pending");
+        advance(backoff * MS);
+    }
+    advance(3_600_000 * MS);
+    c.assert_held_down(51, "a", "five parent exits trip the existing supervisor");
 }
 
 /// A key of `0` names no member (a one-shot program line): it is not supervised.
