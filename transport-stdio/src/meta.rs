@@ -5,8 +5,7 @@
 //! the transport kind's tail its door states. Read once at registration and sealed, so it is data,
 //! held apart from the carrier code it describes.
 
-use busbar_contract::abi::sdk::door::abi_str;
-use busbar_contract::abi::sdk::transport::DEFAULT_BODY_MAX;
+use busbar_contract::abi::sdk::transport::{setting_decls, SettingRow, DEFAULT_BODY_MAX};
 use busbar_contract::abi::transport::{
     SettingDecl, TransportTail, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_CARRIER, SETTING_COUNT,
 };
@@ -21,12 +20,12 @@ pub(crate) const SESSION: bool = true;
 
 /// The one setting this transport reads: the deployment's request-body bound, its line ceiling (a
 /// transport's knobs reach it as the settings its door declares).
-const SETTINGS: &[SettingDecl] = &[SettingDecl {
-    path: abi_str(BODY_MAX_BYTES),
+pub(crate) const SETTING_ROWS: [SettingRow; 1] = [SettingRow {
+    path: BODY_MAX_BYTES,
     kind: SETTING_COUNT,
-    _reserved: 0,
-    default: abi_str(DEFAULT_BODY_MAX),
+    default: DEFAULT_BODY_MAX,
 }];
+const SETTINGS: &[SettingDecl] = &setting_decls(&SETTING_ROWS);
 
 /// The transport kind's tail: the CARRIER of a program's pipes, composing over nothing.
 pub(crate) const TAIL: TransportTail = {

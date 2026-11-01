@@ -25,7 +25,7 @@ pub const CRASH_WINDOW_NS: u64 = 60_000 * MS;
 /// The restart policy of one member's program, on the host's monotonic clock.
 #[derive(Debug, Default)]
 pub struct Supervisor {
-    /// The ends inside the window, oldest first.
+    /// The ends inside the window, in the order their notifications acquired the lock.
     crashes: Vec<u64>,
     /// No spawn before this instant.
     restart_at: Option<u64>,
@@ -45,15 +45,17 @@ impl Supervisor {
         }
         // Short of the trip the window holds 1 to CRASH_THRESHOLD - 1 ends: at most 3 doublings.
         let backoff = BASE_BACKOFF_NS << (self.crashes.len() - 1);
-        self.restart_at = Some(now.saturating_add(backoff));
+        // Clock readings precede the caller's lock: an older notification may arrive last.
+        // It must not cancel a hold-down already established by a newer end.
+        let restart_at = now.saturating_add(backoff);
+        self.restart_at = Some(self.restart_at.map_or(restart_at, |at| at.max(restart_at)));
     }
 
     /// Whether it holds nothing at `now`: no end inside the window, no backoff pending, not
     /// tripped. An idle supervisor reads exactly as a fresh one, so its key's state may be dropped;
     /// a tripped one holds its member down until the member is declared anew.
     pub fn idle(&self, now: u64) -> bool {
-        !self.tripped
-            && self.restart_at.is_none_or(|at| now >= at)
+        self.may_restart(now)
             && self
                 .crashes
                 .iter()

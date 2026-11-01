@@ -42,14 +42,15 @@ use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::io::{Io, IoFailure};
 use busbar_contract::abi::sdk::life::{Held, Life, Refreshed, Refusal};
-use busbar_contract::abi::sdk::transport::{carried, settings_reading};
+use busbar_contract::abi::sdk::transport::settings_reading;
 use busbar_contract::abi::sdk::{Instance, Lent, Out, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn, EmitIn,
     EncodeIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut, ListenIn, ListenOut, LocateIn,
-    LocateOut, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED, DEST_PROGRAM,
+    LocateOut, ReadIn, RefuseIn, ShutIn, WriteIn, CANCEL_NOTHING_MOVED, DEST_PROGRAM, DEST_RETIRED,
     READ_END_OF_FRAME, WRITE_END_OF_FRAME,
 };
+use busbar_contract::carried;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
 
 /// The setting this carrier reads: the deployment's request-body bound, which
@@ -63,8 +64,9 @@ pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 pub const MAX_LINE_BYTES: usize = DEFAULT_REQUEST_BODY_MAX_BYTES;
 
 /// The queued bytes past which a `write` takes nothing more and waits for the pipe to drain. It
-/// gates further writes; the queue itself holds at most this plus one line (at most the line
-/// ceiling), the frame that crossed it.
+/// gates further writes; bytes still owed are bounded by this plus one frame at the line ceiling
+/// and its appended LF. Until compacted, the buffer can also retain a sent prefix smaller than
+/// the bytes still owed.
 pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
 
 /// The capacity a connection's buffer keeps once it is empty: what one large message grew it past
@@ -79,10 +81,20 @@ const READ_CHUNK: usize = 16 * 1024;
 pub const NOT_A_COUNT: &str =
     "settings: limits.request_body_max_bytes must be a count of bytes above 0";
 
+/// The shared count validator's wording, translated to this carrier's existing byte-count text.
+const SDK_NOT_A_COUNT: &str = "settings: limits.request_body_max_bytes must be a count above 0";
+
 /// The line ceiling `settings` states: its [`BODY_MAX_BYTES`], or [`MAX_LINE_BYTES`] when it states
 /// none.
 fn ceiling(settings: &[u8]) -> Result<usize, Refusal> {
-    match settings_reading(settings, &[BODY_MAX_BYTES])?.get(BODY_MAX_BYTES) {
+    let settings = settings_reading(settings, &crate::meta::SETTING_ROWS).map_err(|refusal| {
+        if refusal.text() == Some(SDK_NOT_A_COUNT) {
+            Refusal::failed(NOT_A_COUNT)
+        } else {
+            refusal
+        }
+    })?;
+    match settings.get(BODY_MAX_BYTES) {
         None => Ok(MAX_LINE_BYTES),
         Some(v) => v
             .as_u64()
@@ -133,7 +145,7 @@ fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
 }
 
 /// Why a read fails.
-pub const TOO_LONG: &str = "read: a line ran past the stdio line ceiling without a newline";
+pub const TOO_LONG: &str = "read: a line ran past the stdio line ceiling";
 /// Why a write fails when the frame it gathers passes the line ceiling.
 pub const FRAME_TOO_LONG: &str = "write: a frame ran past the stdio line ceiling";
 /// Why a write fails when its frame cannot be one line.
@@ -163,8 +175,8 @@ pub struct Carried {
 }
 
 /// One program's connection: the host's handle, the line being cut on the way in, the frame being
-/// gathered and the bytes queued on the way out. A line is answered straight out of `inbound`, so
-/// the data path allocates nothing once its buffers are warm.
+/// gathered and the bytes queued on the way out. A buffered line is answered straight out of
+/// `inbound`. Buffers reuse retained capacity; capacity above `KEEP_BYTES` is released when empty.
 #[derive(Default)]
 struct Conn {
     io: u64,
@@ -252,9 +264,9 @@ impl Carried {
         Some(held)
     }
 
-    /// The member `key`'s program ended at `now`: counted once per connection.
-    /// An end met while the host's clock does not answer stays uncounted, so the
-    /// connection's shut counts it.
+    /// The program under `c.key` ended at `now`: counted once per supervised connection.
+    /// Key zero is unsupervised. With no clock reading, the end stays uncounted so shut can retry
+    /// if the clock answers then.
     fn ended(&self, c: &mut Conn, now: Option<u64>) {
         if c.key == 0 || c.counted {
             return;
@@ -302,17 +314,6 @@ fn now(i: &Instance<'_, State>) -> Option<u64> {
         _reserved: 0,
     };
     services.clock_now(handle).ok().map(|r| r.mono_ns)
-}
-
-/// The SDK's [`carried`] for the op named by the literal `$op`, its no-instance refusal static: with
-/// no instance there is nothing to keep an owned text.
-macro_rules! carried {
-    ($inst:expr, $op:literal) => {
-        match $inst.get() {
-            None => Err(Refusal::failed(concat!($op, ": no open instance"))),
-            Some(_) => carried(&$inst, $op),
-        }
-    };
 }
 
 /// The host's answer, as this op's refusal: the host's policy is REFUSED, the system's FAILED.
@@ -478,6 +479,18 @@ impl SafeSlot for Dial {
         let Some(dest) = i.dest() else {
             return o.fail(Refusal::failed("dial: no destination"));
         };
+        if dest.kind == DEST_RETIRED {
+            let Some(held) = inst.get() else {
+                return o.fail(Refusal::failed("dial: no open instance"));
+            };
+            let retired = {
+                let mut supervised = lock(&held.life().supervised);
+                supervised.remove(&i.supervision_key)
+            };
+            drop(retired);
+            o.set(|o| &o.conn, 0);
+            return Outcome::Ready;
+        }
         if dest.kind != DEST_PROGRAM {
             return o.fail(Refusal::refused(
                 "dial: a stdio carrier reaches a program, never an authority",
@@ -514,6 +527,9 @@ impl SafeSlot for Dial {
             Err(e) => {
                 // A spawn that fails repeats on every attempt: it is counted like any end.
                 if let Some(at) = at {
+                    // Starting a program can outlast its backoff. Time the failure when it
+                    // returns, retaining the earlier reading only if the host clock fails.
+                    let at = now(&inst).unwrap_or(at);
                     lock(&c.supervised).entry(key).or_default().crashed(at);
                 }
                 o.fail(refusal(&e))
