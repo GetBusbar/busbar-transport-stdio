@@ -91,10 +91,14 @@ struct Script {
     spawn_fails: bool,
     /// Whether the next spawn is REFUSED by the host's policy (not a system failure).
     spawn_refused: bool,
+    /// Time spent by the host attempting the spawn, before it returns its answer.
+    spawn_elapsed_ns: u64,
     /// Whether a read FAILS (the pipe errors) rather than answering.
     read_fails: bool,
     /// Whether a read finds the program ended (`true`) or running (`false`: PENDING).
     ended: bool,
+    /// Independently ended pipes while the script's other handles are still running.
+    ended_handles: Vec<u64>,
     /// The supervised parent exited, independently of a descendant holding its stdout pipe.
     parent_exited: bool,
     /// The handle the next spawn answers.
@@ -116,8 +120,10 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     mono_ns: 1_000 * MS,
     spawn_fails: false,
     spawn_refused: false,
+    spawn_elapsed_ns: 0,
     read_fails: false,
     ended: true,
+    ended_handles: Vec::new(),
     parent_exited: false,
     next_handle: 1,
     spawns: 0,
@@ -145,6 +151,7 @@ fn answer(out: *mut ServiceOut, o: Outcome, value: u64, len: u64) -> RawOutcome 
 extern "C" fn io_spawn(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     let (fails, refused, h) = with(|sc| {
         sc.spawns += 1;
+        sc.mono_ns += sc.spawn_elapsed_ns;
         sc.next_handle += 1;
         (sc.spawn_fails, sc.spawn_refused, sc.next_handle)
     });
@@ -168,7 +175,7 @@ extern "C" fn io_read(_: HostCtx, input: *const c_void, out: *mut ServiceOut) ->
         unsafe { std::ptr::write_bytes(i.buf, b'x', i.cap) };
         return answer(out, Outcome::Ready, 0, i.cap as u64);
     }
-    if with(|sc| sc.ended) {
+    if with(|sc| sc.ended || sc.ended_handles.contains(&i.handle)) {
         answer(out, Outcome::Ready, 0, 0)
     } else {
         answer(out, Outcome::Pending, 0, 0)
@@ -243,16 +250,23 @@ fn services() -> &'static HostSlots {
 struct Carrier {
     inst: *mut c_void,
     _tables: Box<HostTables>,
+    _io: Box<IoSlots>,
 }
 
 impl Carrier {
     fn open() -> Self {
+        Self::with_exit_reporting(true)
+    }
+
+    fn with_exit_reporting(report_exits: bool) -> Self {
         *SCRIPT.lock().unwrap_or_else(PoisonError::into_inner) = Script {
             mono_ns: 1_000 * MS,
             spawn_fails: false,
             spawn_refused: false,
+            spawn_elapsed_ns: 0,
             read_fails: false,
             ended: true,
+            ended_handles: Vec::new(),
             parent_exited: false,
             next_handle: 1,
             spawns: 0,
@@ -261,6 +275,10 @@ impl Carrier {
             write_fails: false,
             write_pends: false,
         };
+        let io = Box::new(IoSlots {
+            ends: report_exits.then_some(io_ends),
+            ..IO
+        });
         let tables = Box::new(HostTables {
             size: size_of::<HostTables>() as u32,
             _reserved: 0,
@@ -268,7 +286,7 @@ impl Carrier {
             wake: None,
             conns: std::ptr::null(),
             services: services(),
-            io: &IO,
+            io: &*io,
         });
         let mut i: OpenIn = z();
         i.host = &*tables;
@@ -286,6 +304,7 @@ impl Carrier {
         Self {
             inst: o.instance,
             _tables: tables,
+            _io: io,
         }
     }
 
@@ -348,7 +367,13 @@ impl Carrier {
 
     /// Assert the member `key`'s dial is REFUSED with the hold-down reason (`msg` says why).
     fn assert_held_down(&self, key: u64, token: &str, msg: &str) {
+        let spawns = with(|sc| sc.spawns);
         let (r, _, why) = self.dial_why(key, token);
+        assert_eq!(
+            with(|sc| sc.spawns),
+            spawns,
+            "{msg}: a held-down dial must not spawn"
+        );
         assert_eq!(r, Outcome::Refused, "{msg}");
         assert!(
             why.contains("held down"),
@@ -452,6 +477,114 @@ fn a_spawn_that_fails_counts_as_an_end() {
     );
 }
 
+#[test]
+fn a_slow_failed_or_refused_spawn_starts_its_backoff_when_the_failure_returns() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    for policy_refused in [false, true] {
+        let c = Carrier::open();
+        with(|sc| {
+            sc.spawn_elapsed_ns = 500 * MS;
+            sc.spawn_fails = !policy_refused;
+            sc.spawn_refused = policy_refused;
+        });
+        let expected = if policy_refused {
+            Outcome::Refused
+        } else {
+            Outcome::Failed
+        };
+        assert_eq!(c.dial(2, "a").0, expected);
+        with(|sc| {
+            sc.spawn_elapsed_ns = 0;
+            sc.spawn_fails = false;
+            sc.spawn_refused = false;
+        });
+        c.assert_held_down(
+            2,
+            "a",
+            "the full backoff follows the completed spawn attempt",
+        );
+        advance(100 * MS - 1);
+        c.assert_held_down(2, "a", "one nanosecond remains in the backoff");
+        advance(1);
+        assert_eq!(c.dial(2, "a").0, Outcome::Ready);
+    }
+}
+
+#[test]
+fn a_shut_probe_does_not_drain_an_unbounded_running_program() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(81, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.flood = 128;
+    });
+    c.shut(conn);
+    assert!(
+        with(|sc| sc.flood) > 0,
+        "the probe must leave ongoing output unread"
+    );
+    assert_eq!(
+        c.dial(81, "a").0,
+        Outcome::Ready,
+        "a still-running program is not an end"
+    );
+}
+
+#[test]
+fn a_pipe_error_first_seen_at_shut_counts_as_an_end() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(82, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.read_fails = true;
+    });
+    c.shut(conn);
+    c.assert_held_down(82, "a", "the shut probe observed the failed pipe");
+}
+
+#[test]
+fn a_clean_shut_on_a_host_without_exit_reporting_is_not_an_end() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::with_exit_reporting(false);
+    with(|sc| sc.ended = false);
+    for _ in 0..10 {
+        let (r, conn) = c.dial(83, "a");
+        assert_eq!(r, Outcome::Ready);
+        c.shut(conn);
+    }
+}
+
+#[test]
+fn failed_and_refused_keyless_spawns_never_require_a_clock_or_trip_a_shared_key() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    with(|sc| {
+        sc.clock_fails = true;
+        sc.spawn_fails = true;
+    });
+    for _ in 0..6 {
+        assert_eq!(c.dial(0, "a").0, Outcome::Failed);
+    }
+    with(|sc| {
+        sc.spawn_fails = false;
+        sc.spawn_refused = true;
+    });
+    for _ in 0..6 {
+        assert_eq!(c.dial(0, "a").0, Outcome::Refused);
+    }
+    with(|sc| sc.spawn_refused = false);
+    assert_eq!(c.dial(0, "a").0, Outcome::Ready);
+    assert_eq!(
+        with(|sc| sc.spawns),
+        13,
+        "every keyless attempt reached the host"
+    );
+}
+
 /// A spawn the host's POLICY refuses answers REFUSED, not FAILED: the host's refusal is not a
 /// system failure. Like any spawn that fails it is counted as an end of the member's program
 /// (the policy repeats on every attempt): the next dial is held down.
@@ -544,6 +677,32 @@ fn two_members_running_one_program_trip_independently() {
         Outcome::Ready,
         "its sibling runs the same program"
     );
+}
+
+#[test]
+fn overlapping_handles_of_one_member_count_only_the_pipe_that_ended() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    with(|sc| sc.ended = false);
+    let (r, ended) = c.dial(12, "a");
+    assert_eq!(r, Outcome::Ready);
+    let ended_handle = with(|sc| sc.next_handle);
+    let (r, running) = c.dial(12, "a");
+    assert_eq!(r, Outcome::Ready);
+    assert_ne!(ended, running);
+    assert_ne!(ended_handle, with(|sc| sc.next_handle));
+    with(|sc| sc.ended_handles.push(ended_handle));
+    assert_eq!(c.read(running), Outcome::Pending);
+    assert_eq!(c.read(ended), Outcome::Ready);
+    c.assert_held_down(12, "a", "one overlapping pipe ended");
+    c.shut(running);
+    c.shut(ended);
+    advance(100 * MS - 1);
+    c.assert_held_down(12, "a", "the first end's backoff still holds");
+    advance(1);
+    let (r, next) = c.dial(12, "a");
+    assert_eq!(r, Outcome::Ready, "neither shut counted another end");
+    c.shut(next);
 }
 
 /// (ii) A member dropped and re-added is a new member: a new key, fresh supervision.

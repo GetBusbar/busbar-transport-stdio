@@ -3,6 +3,20 @@
 
 use super::*;
 
+#[test]
+fn a_delayed_end_notification_does_not_shorten_an_existing_hold_down() {
+    let mut s = Supervisor::default();
+    s.crashed(5_000 * MS);
+    // Another caller sampled the clock earlier, then waited for the supervisor's lock.
+    s.crashed(4_000 * MS);
+    assert!(!s.may_restart(5_100 * MS - 1));
+    assert!(s.may_restart(5_100 * MS));
+    // The delayed notification is still counted in the existing window.
+    s.crashed(5_100 * MS);
+    assert!(!s.may_restart(5_500 * MS - 1));
+    assert!(s.may_restart(5_500 * MS));
+}
+
 /// The crash-loop policy of predev's connector, figure for figure: a backoff doubling from 100 ms,
 /// and the fifth end inside a minute stopping the restarts for good.
 #[test]
@@ -40,6 +54,20 @@ fn ends_outside_the_window_are_forgotten() {
         s.may_restart(later + BASE_BACKOFF_NS),
         "one end in the window: base backoff"
     );
+}
+
+#[test]
+fn an_end_exactly_one_window_old_still_counts_and_is_not_idle() {
+    let mut one = Supervisor::default();
+    one.crashed(0);
+    assert!(!one.idle(CRASH_WINDOW_NS));
+    assert!(one.idle(CRASH_WINDOW_NS + 1));
+    let mut trip = Supervisor::default();
+    for _ in 0..4 {
+        trip.crashed(0);
+    }
+    trip.crashed(CRASH_WINDOW_NS);
+    assert!(!trip.may_restart(CRASH_WINDOW_NS + 3600 * MS));
 }
 
 /// A supervisor holding no end inside the window and no pending backoff is idle (it reads as a

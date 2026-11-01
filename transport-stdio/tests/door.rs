@@ -203,8 +203,11 @@ extern "C" fn io_spawn(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
     // SAFETY: the host-lent list the carrier passed through.
     let args = unsafe { std::slice::from_raw_parts(i.args, i.args_len) };
     let args = args.iter().map(|a| text(*a)).collect();
-    with(|sc| sc.spawned.push((text(i.program), args)));
-    answer(out, Outcome::Ready, 7, 0)
+    let handle = with(|sc| {
+        sc.spawned.push((text(i.program), args));
+        6 + sc.spawned.len() as u64
+    });
+    answer(out, Outcome::Ready, handle, 0)
 }
 
 extern "C" fn io_read(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
@@ -476,6 +479,75 @@ fn each_line_is_one_frame_whatever_the_reads_cut() {
 }
 
 #[test]
+fn a_blank_first_line_and_exactly_one_terminating_cr_are_preserved() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    for (input, expected) in [
+        (&b"\n"[..], &b""[..]),
+        (&b"\r\n"[..], &b""[..]),
+        (&b"a\r\r\n"[..], &b"a\r"[..]),
+        (&b"a\rb\n"[..], &b"a\rb"[..]),
+    ] {
+        let h = Host::new(vec![Some(input.to_vec()), None]);
+        assert_eq!(
+            h.read(64),
+            (Outcome::Ready, expected.to_vec(), true, String::new())
+        );
+    }
+    let h = Host::new(Vec::new());
+    assert_eq!(h.write(b"a\rb", true), (Outcome::Ready, String::new()));
+    with(|sc| assert_eq!(sc.written, b"a\rb\n"));
+}
+
+#[test]
+fn an_unterminated_final_line_keeps_its_trailing_cr() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::new(vec![Some(b"last\r".to_vec()), Some(Vec::new())]);
+    assert_eq!(
+        h.read(64),
+        (Outcome::Ready, b"last\r".to_vec(), true, String::new())
+    );
+    assert_eq!(
+        h.read(64),
+        (Outcome::Ready, Vec::new(), false, String::new())
+    );
+}
+
+#[test]
+fn an_oversized_line_has_an_accurate_diagnostic_with_or_without_a_newline() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    for terminated in [false, true] {
+        let mut input = vec![b'x'; 65];
+        if terminated {
+            input.push(b'\n');
+        }
+        let h = Host::with_settings(Some(&body_max(64)), vec![Some(input), None]);
+        let (outcome, _, _, why) = h.read(256);
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(why, "read: a line ran past the stdio line ceiling");
+    }
+}
+
+#[test]
+fn a_gathered_frame_at_the_exact_ceiling_succeeds_and_an_oversized_one_leaves_no_prefix() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::with_settings(Some(&body_max(64)), Vec::new());
+    assert_eq!(h.write(&[b'x'; 32], false).0, Outcome::Ready);
+    assert_eq!(h.write(&[b'x'; 32], true).0, Outcome::Ready);
+    assert_eq!(h.write(&[b'y'; 64], false).0, Outcome::Ready);
+    assert_eq!(
+        h.write(b"z", false),
+        (
+            Outcome::Failed,
+            busbar_transport_stdio::door::FRAME_TOO_LONG.to_owned()
+        )
+    );
+    assert_eq!(h.write(b"next", true).0, Outcome::Ready);
+    let mut expected = vec![b'x'; 64];
+    expected.extend_from_slice(b"\nnext\n");
+    with(|sc| assert_eq!(sc.written, expected));
+}
+
+#[test]
 fn a_line_past_the_ceiling_fails_the_read() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let long = vec![b'x'; MAX_LINE_BYTES + 1];
@@ -725,6 +797,28 @@ fn a_refresh_moves_the_line_ceiling() {
         Outcome::Failed,
         "the refreshed bound holds"
     );
+}
+
+#[test]
+fn a_refresh_lowers_and_raises_the_read_ceiling_on_an_existing_connection() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    for (initial, refreshed, expected) in [(128, 64, Outcome::Failed), (64, 128, Outcome::Ready)] {
+        let mut line = vec![b'x'; 100];
+        line.push(b'\n');
+        let h = Host::with_settings(Some(&body_max(initial)), vec![Some(line)]);
+        assert_eq!(h.refresh(&body_max(refreshed)), Outcome::Ready);
+        let (outcome, bytes, end, why) = h.read(256);
+        assert_eq!(outcome, expected);
+        if expected == Outcome::Ready {
+            assert_eq!(bytes, vec![b'x'; 100]);
+            assert!(end);
+            assert!(why.is_empty());
+        } else {
+            assert!(bytes.is_empty());
+            assert!(!end);
+            assert_eq!(why, TOO_LONG);
+        }
+    }
 }
 
 /// A bound that is no count of bytes is FAILED at `validate`, before any instance opens on it:
@@ -1009,6 +1103,19 @@ fn line_failure_texts_carry_the_op_prefix() {
 fn instance_close_closes_every_held_connection() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
+    let args = [s("--stdio")];
+    let mut destination: Destination = z();
+    destination.kind = DEST_PROGRAM;
+    destination.program = s("/usr/bin/server");
+    destination.args = args.as_ptr();
+    destination.args_len = args.len();
+    let mut dial: DialIn = z();
+    dial.dest = &destination;
+    let mut opened: ConnOut = z();
+    assert_eq!(
+        call(ops().dial, h.inst, &mut dial, &mut opened, slot::DIAL),
+        Outcome::Ready
+    );
     with(|sc| assert!(sc.closed.is_empty()));
     let mut i: InHead = z();
     let mut o: OutHead = z();
@@ -1016,7 +1123,31 @@ fn instance_close_closes_every_held_connection() {
         call(ops().head.close, h.inst, &mut i, &mut o, life::CLOSE),
         Outcome::Ready
     );
-    with(|sc| assert_eq!(sc.closed, [7], "the held program handle was closed"));
+    with(|sc| {
+        let mut closed = sc.closed.clone();
+        closed.sort_unstable();
+        assert_eq!(
+            closed,
+            [7, 8],
+            "both distinct held program handles were closed"
+        );
+    });
+}
+
+#[test]
+fn shutting_the_same_connection_twice_closes_its_handle_once() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::new(Vec::new());
+    let mut input: ShutIn = z();
+    input.conn = h.conn;
+    for _ in 0..2 {
+        let mut out: OutHead = z();
+        assert_eq!(
+            call(ops().shut, h.inst, &mut input, &mut out, slot::SHUT),
+            Outcome::Ready
+        );
+    }
+    with(|sc| assert_eq!(sc.closed, [7]));
 }
 
 #[test]
