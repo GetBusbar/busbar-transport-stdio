@@ -95,12 +95,17 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         let oh = std::ptr::from_mut(o).cast::<OutHead>();
         (*oh).size = size_of::<O>() as u32;
     }
-    (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    )
-    .outcome()
+    // SAFETY: each private fixture caller selects this slot's exact input/output types.
+    // Both aligned frames and their nested loans stay live through the synchronous crossing;
+    // `inst` is null for open or owned by the live fixture until its matching close returns.
+    unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+        .outcome()
+    }
 }
 
 // ── the allocation witness ───────────────────────────────────────────────────────────────────────
