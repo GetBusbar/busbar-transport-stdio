@@ -787,6 +787,19 @@ fn a_refresh_moves_the_line_ceiling() {
     );
 }
 
+/// A refresh moves the READ path's bound too: a line the opening bound admitted fails the read once
+/// a refresh lowered the bound under it (the ceiling is loaded per op, not snapshotted at open).
+#[test]
+fn a_refresh_moves_the_read_ceiling() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut line = vec![b'x'; 100];
+    line.push(b'\n');
+    let h = Host::new(vec![Some(line), None]);
+    assert_eq!(h.refresh(&body_max(64)), Outcome::Ready);
+    let (r, _, _, why) = h.read(256);
+    assert_eq!((r, why.as_str()), (Outcome::Failed, TOO_LONG));
+}
+
 /// A bound that is no count of bytes is FAILED at `validate`, before any instance opens on it:
 /// a string, a negative number, a fraction and a null alike. RED (row 159, stdio MEDIUM M2): the
 /// carrier validated nothing.
