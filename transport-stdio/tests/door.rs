@@ -644,7 +644,7 @@ fn shut_closes_the_program_and_an_authority_or_a_listen_is_refused() {
     );
 }
 
-/// THE DATA PATH ALLOCATES NOTHING once a connection's buffers are warm (`BUSBAR-1.6.0.md` §11.2,
+/// A buffered line and a complete frame allocate nothing once connection buffers are warm.
 
 #[test]
 fn a_buffered_line_and_a_whole_frame_allocate_nothing() {

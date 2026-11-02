@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE STDIO SUPERVISOR IS THE STDIO TRANSPORT'S (`BUSBAR-1.6.0.md` THE DESIGN §2, l.388), driven
+//! The stdio transport owns its program supervisor, driven
 //! through the carrier's own table over a SCRIPTED host: its I/O (a spawn that answers or fails, a
 //! read that answers the program's end or PENDING while it runs) and its one clock (`clock.now`,
-//! monotonic, set by the test). The policy is predev's crash-loop policy (the connector's
+//! monotonic, set by the test). Its compatible crash-loop policy (the connector's
 //! `program.rs`, the MCP-COMPAT baseline): a program that ends is held down under a backoff
 //! doubling from 100 ms, and five ends inside a minute stop its restarts until its member is
 //! declared anew. A dial the policy holds down is REFUSED.
@@ -19,7 +19,6 @@
 //! read the program fails (a line past the ceiling) is an end, as predev counted every end of a
 //! generation the member did not ask for, failures included.
 //!
-//! RED before the supervisor moved here: the carrier spawned whatever it was asked to, every time.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
