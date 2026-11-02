@@ -20,7 +20,7 @@ use busbar_contract::abi::host::io::{
 };
 use busbar_contract::abi::host::service::ServiceOut;
 use busbar_contract::abi::mechanism::call::{
-    AbiStr, Blob, InHead, Op, OutHead, Outcome, RawOutcome, BLOB_JSON,
+    AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, RawOutcome, BLOB_JSON,
 };
 use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::extensions::declares;
@@ -110,6 +110,8 @@ thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
     /// How many allocations this thread made while counting.
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    /// The bytes this thread's counted allocations added to the heap, net of what it freed.
+    static RETAINED: Cell<i64> = const { Cell::new(0) };
 }
 
 /// The system allocator, counting the allocations a test thread makes while it is armed.
@@ -121,26 +123,37 @@ impl Witness {
             let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
         }
     }
+
+    /// Book `delta` bytes onto (or off) the heap this thread holds while it is armed.
+    fn retain(delta: i64) {
+        if COUNTING.try_with(Cell::get).unwrap_or(false) {
+            let _ = RETAINED.try_with(|n| n.set(n.get() + delta));
+        }
+    }
 }
 
 // SAFETY: every call is forwarded to `System` unchanged; the count touches only const thread-locals.
 unsafe impl GlobalAlloc for Witness {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Self::count();
+        Self::retain(layout.size() as i64);
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         Self::count();
+        Self::retain(layout.size() as i64);
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         Self::count();
+        Self::retain(new_size as i64 - layout.size() as i64);
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        Self::retain(-(layout.size() as i64));
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -158,12 +171,24 @@ fn allocations<R>(f: impl FnOnce() -> R) -> (R, u64) {
     (r, ALLOCATIONS.with(Cell::get))
 }
 
+/// The bytes `f` leaves on the heap on this thread (allocated and not freed by its end).
+fn retained<R>(f: impl FnOnce() -> R) -> (R, i64) {
+    RETAINED.with(|n| n.set(0));
+    COUNTING.with(|c| c.set(true));
+    let r = f();
+    COUNTING.with(|c| c.set(false));
+    (r, RETAINED.with(Cell::get))
+}
+
 // ── the scripted host ────────────────────────────────────────────────────────────────────────────
+
+/// One spawn the host was asked for: the program, its arguments, its environment.
+type Spawned = (String, Vec<String>, Vec<(String, String)>);
 
 #[derive(Default)]
 struct Script {
     /// The program `io.spawn` was asked for, with its arguments.
-    spawned: Vec<(String, Vec<String>)>,
+    spawned: Vec<Spawned>,
     /// What `io.read` answers next, in order: `None` = PENDING; an empty chunk = the end.
     reads: Vec<Option<Vec<u8>>>,
     /// Every byte `io.write` took.
@@ -203,7 +228,10 @@ extern "C" fn io_spawn(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
     // SAFETY: the host-lent list the carrier passed through.
     let args = unsafe { std::slice::from_raw_parts(i.args, i.args_len) };
     let args = args.iter().map(|a| text(*a)).collect();
-    with(|sc| sc.spawned.push((text(i.program), args)));
+    // SAFETY: the host-lent environment the carrier passed through.
+    let env = unsafe { std::slice::from_raw_parts(i.env, i.env_len) };
+    let env = env.iter().map(|f| (text(f.name), text(f.value))).collect();
+    with(|sc| sc.spawned.push((text(i.program), args, env)));
     answer(out, Outcome::Ready, 7, 0)
 }
 
@@ -307,11 +335,17 @@ impl Host {
         );
         assert_eq!(r, Outcome::Ready);
         let args = [s("--stdio")];
+        let env = [Field {
+            name: s("TOKEN"),
+            value: s("t"),
+        }];
         let mut dest: Destination = z();
         dest.kind = DEST_PROGRAM;
         dest.program = s("/usr/bin/server");
         dest.args = args.as_ptr();
         dest.args_len = args.len();
+        dest.env = env.as_ptr();
+        dest.env_len = env.len();
         let mut di: DialIn = z();
         di.dest = &dest;
         let mut co: ConnOut = z();
@@ -429,9 +463,35 @@ fn a_dial_spawns_exactly_the_program_it_is_lent() {
     with(|sc| {
         assert_eq!(
             sc.spawned,
-            [("/usr/bin/server".to_owned(), vec!["--stdio".to_owned()])]
+            [(
+                "/usr/bin/server".to_owned(),
+                vec!["--stdio".to_owned()],
+                vec![("TOKEN".to_owned(), "t".to_owned())]
+            )]
         );
     });
+}
+
+/// A long-lived member connection that once carried a large frame does not keep that capacity: a
+/// frame gathered over several writes (`message`), queued whole (`outbound`) and written is given
+/// back once it is, so the connection holds a working size, not its high-water mark.
+#[test]
+fn a_written_frame_gives_back_what_it_grew_the_buffers_to() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::new(Vec::new());
+    let big = vec![b'x'; 4 * 1024 * 1024];
+    // The scripted pipe's record of what it took is not the carrier's: make room before counting.
+    with(|sc| sc.written.reserve(5 * 1024 * 1024));
+    let (outcomes, kept) = retained(|| {
+        let gathered = h.write(&big, false).0;
+        (gathered, h.write(b"{}", true).0)
+    });
+    assert_eq!(outcomes, (Outcome::Ready, Outcome::Ready));
+    assert_eq!(with(|sc| sc.written.len()), big.len() + 3, "all of it went");
+    assert!(
+        kept < 1024 * 1024,
+        "the connection kept {kept} bytes after a 4 MiB frame was written"
+    );
 }
 
 #[test]
