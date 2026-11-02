@@ -142,12 +142,17 @@ fn call<I, O>(
         };
         (*std::ptr::from_mut(out).cast::<OutHead>()).size = size_of::<O>() as u32;
     }
-    op.expect("the slot is served")(
-        instance,
-        std::ptr::from_ref(input).cast(),
-        std::ptr::from_mut(out).cast(),
-    )
-    .outcome()
+    // SAFETY: every fixture call pairs this slot with its exact ABI frames. The live,
+    // aligned input and writable output (and their caller-owned nested loans) last through
+    // this synchronous call; `instance` is null for open or belongs to the live Opened fixture.
+    unsafe {
+        op.expect("the slot is served")(
+            instance,
+            std::ptr::from_ref(input).cast(),
+            std::ptr::from_mut(out).cast(),
+        )
+        .outcome()
+    }
 }
 
 struct Opened {
