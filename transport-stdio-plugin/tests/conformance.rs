@@ -1123,6 +1123,7 @@ fn the_statement_carries_the_declares_document() {
 fn spawn_admission(command: &str, args: &[String], env: &[(String, String)]) -> Admission {
     let program = busbar_contract::conn::Program {
         command: command.into(),
+        cwd: None,
         args: args.to_vec(),
         env: env.to_vec(),
         env_refs: Vec::new(),
