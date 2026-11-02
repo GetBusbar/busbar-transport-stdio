@@ -284,13 +284,13 @@ fn flush_once(p: &Plugin<Transport>, side: &Side, conn: u64, resume: bool) -> St
     format!("{:?} err={:?}", c.outcome, err(&c))
 }
 
-fn write(p: &Plugin<Transport>, side: &Side, conn: u64, bytes: &[u8]) -> String {
+fn write_once(p: &Plugin<Transport>, side: &Side, conn: u64, bytes: &[u8], resume: bool) -> String {
     let mut i: WriteIn = input();
     i.conn = conn;
     i.bytes = bytes.as_ptr();
     i.len = bytes.len();
     i.flags = WRITE_END_OF_FRAME;
-    let (c, o) = go::<_, IoOut>(p, side, false, slot::WRITE, i);
+    let (c, o) = go::<_, IoOut>(p, side, resume, slot::WRITE, i);
     match c.outcome {
         Outcome::Ready => format!("Ready len={}", o.len),
         other => format!("{other:?} err={:?}", err(&c)),
@@ -1237,4 +1237,16 @@ fn no_outbound_auth_family_is_driven() {
 #[test]
 fn red_a_networked_door_with_no_connection_table_is_refused() {
     negative::red_a_networked_door_with_no_connection_table_is_refused();
+}
+
+fn write(p: &Plugin<Transport>, side: &Side, conn: u64, bytes: &[u8]) -> String {
+    let mut answer = write_once(p, side, conn, bytes, false);
+    let until = Instant::now() + Duration::from_secs(5);
+    while answer.starts_with("Pending") && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(2));
+        if side.woken.0.swap(false, Ordering::SeqCst) {
+            answer = write_once(p, side, conn, bytes, true);
+        }
+    }
+    answer
 }
