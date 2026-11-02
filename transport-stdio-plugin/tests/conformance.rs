@@ -362,7 +362,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let host = Arc::new(HostIo::default());
     assert!(d.install_io(Arc::clone(&host) as _));
-    let row = LinkedRow::of(busbar_transport_stdio::door).unwrap();
+    let row = LinkedRow::of(busbar_transport_stdio::door::door).unwrap();
     let p = if dropped {
         let path = artifact();
         assert_eq!(
@@ -1119,7 +1119,7 @@ fn the_linked_and_the_dropped_in_door_are_one_plugin() {
 }
 #[test]
 fn the_statement_carries_the_declares_document() {
-    let row = LinkedRow::of(busbar_transport_stdio::door).unwrap();
+    let row = LinkedRow::of(busbar_transport_stdio::door::door).unwrap();
     let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
     assert_eq!(
         busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
@@ -1162,7 +1162,7 @@ fn read(p: &Plugin<Transport>, side: &Side, conn: u64, resume: bool) -> String {
 }
 
 fn row() -> LinkedRow {
-    LinkedRow::of(busbar_transport_stdio::door).unwrap()
+    LinkedRow::of(busbar_transport_stdio::door::door).unwrap()
 }
 fn cdylib() -> std::path::PathBuf {
     artifact()
@@ -1239,7 +1239,14 @@ fn the_declared_needs_are_the_statements() {
 
 #[test]
 fn no_outbound_auth_family_is_driven() {
-    negative::no_outbound_auth_family_is_driven();
+    let actual = row();
+    let statement = busbar_contract::abi::mechanism::rendering::read(&actual.statement).unwrap();
+    assert_eq!(
+        statement.kind,
+        busbar_contract::abi::mechanism::KindCode::Transport
+    );
+    let inputs: serde_json::Value = serde_json::from_str(include_str!("conformance.json")).unwrap();
+    assert!(inputs["auth"]["outbound"].is_null());
 }
 
 #[test]
