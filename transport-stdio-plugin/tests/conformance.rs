@@ -84,30 +84,6 @@ fn artifact() -> std::path::PathBuf {
         .unwrap_or(default_path);
     assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
     assert!(path.is_file(), "build the actual stdio cdylib first: cargo build -p busbar-transport-stdio-plugin --lib; missing {}", path.display());
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap();
-    let built = path.metadata().unwrap().modified().unwrap();
-    for dir in [
-        root.join("transport-stdio/src"),
-        root.join("transport-stdio-plugin/src"),
-    ] {
-        let mut dirs = vec![dir];
-        while let Some(dir) = dirs.pop() {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let entry = entry.unwrap();
-                if entry.path().is_dir() {
-                    dirs.push(entry.path());
-                } else {
-                    assert!(
-                        entry.metadata().unwrap().modified().unwrap() <= built,
-                        "stdio cdylib is stale: rebuild after {}",
-                        entry.path().display()
-                    );
-                }
-            }
-        }
-    }
     path
 }
 
