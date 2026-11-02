@@ -725,12 +725,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
                     answer
                 ),
             };
-            results.push((
-                (&format!("write #{n}")).to_string(),
-                answer,
-                crossed,
-                resumed,
-            ));
+            results.push((format!("write #{n}"), answer, crossed, resumed));
         };
         if refused {
             continue;
@@ -769,12 +764,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
                     answer
                 ),
             };
-            results.push((
-                (&format!("read #{n}")).to_string(),
-                answer,
-                crossed,
-                resumed,
-            ));
+            results.push((format!("read #{n}"), answer, crossed, resumed));
         };
     }
     let pend = &k["pending"];
