@@ -498,6 +498,11 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         value
     };
     let host_listener = listens.then(|| host.made(ls.ticket.ticket())).flatten();
+    assert_eq!(
+        host_listener.is_some(),
+        listens,
+        "only a listening carrier minted a listener"
+    );
     if listens {
         let mut far = TcpStream::connect(&bound).expect("the script reaches the listener");
         let _ = far.set_read_timeout(Some(Duration::from_secs(5)));
@@ -1007,7 +1012,9 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
 
     {
         let before = counts(&p);
-        let answer = format!("{}", host.held() == usize::from(host_listener.is_some()));
+        // The old holds_only(listener) accepted an empty table too. The actual carrier's
+        // CLOSE releases its listener as well as every connection, so demand zero handles.
+        let answer = format!("{}", host.held() == 0);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
