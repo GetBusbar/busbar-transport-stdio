@@ -1243,7 +1243,7 @@ fn no_outbound_auth_family_is_driven() {
     let statement = busbar_contract::abi::mechanism::rendering::read(&actual.statement).unwrap();
     assert_eq!(
         statement.kind,
-        busbar_contract::abi::mechanism::KindCode::Transport
+        busbar_contract::abi::mechanism::KindCode::Transport as u32
     );
     let inputs: serde_json::Value = serde_json::from_str(include_str!("conformance.json")).unwrap();
     assert!(inputs["auth"]["outbound"].is_null());
