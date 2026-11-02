@@ -27,6 +27,8 @@ pub const CRASH_WINDOW_NS: u64 = 60_000 * MS;
 pub struct Supervisor {
     /// The ends inside the window, in the order their notifications acquired the lock.
     crashes: Vec<u64>,
+    /// The newest end observed, even when an older notification arrives after it.
+    latest_crash: Option<u64>,
     /// No spawn before this instant.
     restart_at: Option<u64>,
     /// [`CRASH_THRESHOLD`] ends inside the window: no restart until the member is declared anew.
@@ -36,8 +38,14 @@ pub struct Supervisor {
 impl Supervisor {
     /// The program ended (or could not be spawned) at `now`.
     pub fn crashed(&mut self, now: u64) {
+        let latest = self.latest_crash.map_or(now, |at| at.max(now));
+        self.latest_crash = Some(latest);
         self.crashes
-            .retain(|t| now.saturating_sub(*t) <= CRASH_WINDOW_NS);
+            .retain(|t| latest.saturating_sub(*t) <= CRASH_WINDOW_NS);
+        // A delayed notification cannot bring an expired end back into the latest window.
+        if latest.saturating_sub(now) > CRASH_WINDOW_NS {
+            return;
+        }
         self.crashes.push(now);
         if self.crashes.len() >= CRASH_THRESHOLD {
             self.tripped = true;

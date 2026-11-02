@@ -431,6 +431,11 @@ impl Conn {
                     }
                     return Poll::Pending;
                 }
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(IoFailure::Failed(
+                        "write: the program's pipe accepted no bytes (write zero)".to_owned(),
+                    )));
+                }
                 Poll::Ready(Ok(n)) => self.sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
@@ -453,7 +458,7 @@ busbar_contract::not_served! {
     Begin(BeginIn => FramerOut) "begin";
     /// `ingest`: a framer op.
     Ingest(IngestIn => FramerOut) "ingest";
-    /// `emit`: a framer op.
+    /// `emit`: a framer op, including an `EMIT_TRAILERS` final field block; always refused.
     Emit(EmitIn => FramerOut) "emit";
     /// `encode`: a framer op.
     Encode(EncodeIn => FramerOut) "encode";
