@@ -508,6 +508,31 @@ fn a_failed_pipe_write_is_an_end() {
     c.assert_held_down(5, "a", "still held down after the shut");
 }
 
+/// Bytes already queued that fail to send at the NEXT write's leading drain are an END of the
+/// program, counted at that write: a dial before the connection is shut is already held down.
+#[test]
+fn a_failed_drain_of_queued_bytes_at_the_next_write_is_an_end() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(7, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.write_pends = true;
+    });
+    assert_eq!(c.write_frame(conn, b"{}"), Outcome::Ready, "queued");
+    with(|sc| {
+        sc.write_pends = false;
+        sc.write_fails = true;
+    });
+    assert_eq!(c.write_frame(conn, b"{}"), Outcome::Failed);
+    c.assert_held_down(
+        7,
+        "a",
+        "counted at the failed leading drain, before the shut",
+    );
+}
+
 /// A flush the pipe fails (the frame was queued while the program read nothing, then its stdin
 /// broke) is an END of the program, counted at the flush.
 #[test]
@@ -732,5 +757,26 @@ fn a_program_that_exited_behind_a_full_pipe_is_found_ended_at_its_shut() {
         80,
         "a",
         "its end behind a full pipe was counted at the shut",
+    );
+}
+
+/// A program with more output than a full pipe (the probe's bound, plus the read that would find
+/// its end) is still running: its clean shut is not an end, and the probe does not read it to its
+/// end.
+#[test]
+fn a_program_with_more_than_a_full_pipe_of_output_is_running_at_its_shut() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(81, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = true;
+        sc.flood = 1024 * 1024 / (16 * 1024) + 2;
+    });
+    c.shut(conn);
+    assert_eq!(
+        c.dial(81, "a").0,
+        Outcome::Ready,
+        "more than a full pipe of output is a running program, not an end"
     );
 }
