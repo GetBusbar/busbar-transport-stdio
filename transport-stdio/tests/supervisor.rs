@@ -211,8 +211,13 @@ extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
         let n = with(|sc| {
             let n = sc.write_counts.pop_front().unwrap_or(i.len);
             assert!(n <= i.len);
-            // SAFETY: the carrier lends exactly these initialized bytes during this call.
-            let bytes = unsafe { std::slice::from_raw_parts(i.bytes, n) };
+            let bytes = if n == 0 {
+                &[]
+            } else {
+                assert!(!i.bytes.is_null());
+                // SAFETY: the carrier lends these initialized nonempty bytes during this call.
+                unsafe { std::slice::from_raw_parts(i.bytes, n) }
+            };
             sc.written.extend_from_slice(bytes);
             n
         });

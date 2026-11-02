@@ -222,11 +222,21 @@ fn answer(out: *mut ServiceOut, o: Outcome, value: u64, len: u64) -> RawOutcome 
 extern "C" fn io_spawn(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
     let i = unsafe { input.cast::<SpawnIn>().read() };
-    // SAFETY: the host-lent list the carrier passed through.
-    let args = unsafe { std::slice::from_raw_parts(i.args, i.args_len) };
+    let args = if i.args_len == 0 {
+        &[]
+    } else {
+        assert!(!i.args.is_null() && i.args.is_aligned());
+        // SAFETY: the nonempty host-lent list the carrier passed through, checked non-null/aligned.
+        unsafe { std::slice::from_raw_parts(i.args, i.args_len) }
+    };
     let args = args.iter().map(|a| text(*a)).collect();
-    // SAFETY: the host-lent environment the carrier passed through.
-    let env = unsafe { std::slice::from_raw_parts(i.env, i.env_len) };
+    let env = if i.env_len == 0 {
+        &[]
+    } else {
+        assert!(!i.env.is_null() && i.env.is_aligned());
+        // SAFETY: the nonempty host-lent environment, checked non-null/aligned, is live for this call.
+        unsafe { std::slice::from_raw_parts(i.env, i.env_len) }
+    };
     let env = env.iter().map(|f| (text(f.name), text(f.value))).collect();
     let handle = with(|sc| {
         sc.spawned.push((text(i.program), args, env));
@@ -252,8 +262,13 @@ extern "C" fn io_read(_: HostCtx, input: *const c_void, out: *mut ServiceOut) ->
 extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
     let i = unsafe { input.cast::<IoWriteIn>().read() };
-    // SAFETY: the carrier's bytes.
-    let bytes = unsafe { std::slice::from_raw_parts(i.bytes, i.len) };
+    let bytes = if i.len == 0 {
+        &[]
+    } else {
+        assert!(!i.bytes.is_null());
+        // SAFETY: the carrier's nonempty bytes are live for this call; u8 needs no extra alignment.
+        unsafe { std::slice::from_raw_parts(i.bytes, i.len) }
+    };
     let taken = with(|sc| {
         let Some(k) = sc.trickle else {
             sc.written.extend_from_slice(bytes);
