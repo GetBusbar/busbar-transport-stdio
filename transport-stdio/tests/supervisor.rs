@@ -39,7 +39,7 @@ use busbar_contract::abi::transport::{
     slot, ConnIn, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, WriteIn, DEST_PROGRAM,
     WRITE_END_OF_FRAME,
 };
-use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, TOO_LONG};
+use busbar_transport_stdio::door::{door, HELD_DOWN, MAX_LINE_BYTES, NO_CLOCK, TOO_LONG};
 
 const MS: u64 = 1_000_000;
 
@@ -405,10 +405,7 @@ impl Carrier {
             "{msg}: a held-down dial must not spawn"
         );
         assert_eq!(r, Outcome::Refused, "{msg}");
-        assert!(
-            why.contains("held down"),
-            "{msg}: the reason is the hold-down: {why:?}"
-        );
+        assert_eq!(why, HELD_DOWN, "{msg}: the reason is the hold-down");
     }
 
     /// Write one whole frame to `conn`.
@@ -673,6 +670,31 @@ fn a_failed_pipe_write_is_an_end() {
     with(|sc| sc.write_fails = false);
     c.shut(conn);
     c.assert_held_down(5, "a", "still held down after the shut");
+}
+
+/// Bytes already queued that fail to send at the NEXT write's leading drain are an END of the
+/// program, counted at that write: a dial before the connection is shut is already held down.
+#[test]
+fn a_failed_drain_of_queued_bytes_at_the_next_write_is_an_end() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(7, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = false;
+        sc.write_pends = true;
+    });
+    assert_eq!(c.write_frame(conn, b"{}"), Outcome::Ready, "queued");
+    with(|sc| {
+        sc.write_pends = false;
+        sc.write_fails = true;
+    });
+    assert_eq!(c.write_frame(conn, b"{}"), Outcome::Failed);
+    c.assert_held_down(
+        7,
+        "a",
+        "counted at the failed leading drain, before the shut",
+    );
 }
 
 /// A flush the pipe fails (the frame was queued while the program read nothing, then its stdin
@@ -957,7 +979,7 @@ fn a_member_is_not_run_when_the_clock_does_not_answer() {
     let (r, _, why) = c.dial_why(60, "a");
     assert_eq!(r, Outcome::Failed);
     assert_eq!(with(|sc| sc.spawns), before, "no program was spawned");
-    assert!(why.contains("did not answer"), "reason was: {why}");
+    assert_eq!(why, NO_CLOCK);
     assert_eq!(c.dial(0, "a").0, Outcome::Ready);
 }
 
@@ -1038,5 +1060,26 @@ fn a_program_that_exited_behind_a_full_pipe_is_found_ended_at_its_shut() {
         80,
         "a",
         "its end behind a full pipe was counted at the shut",
+    );
+}
+
+/// A program whose output fills the probe's whole bound (a full pipe plus one read) is still
+/// running: the end read is the first one past the bound, so its clean shut is not an end and the
+/// probe does not read it to its end.
+#[test]
+fn a_program_with_more_than_a_full_pipe_of_output_is_running_at_its_shut() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(81, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = true;
+        sc.flood = 1024 * 1024 / (16 * 1024) + 1;
+    });
+    c.shut(conn);
+    assert_eq!(
+        c.dial(81, "a").0,
+        Outcome::Ready,
+        "more than a full pipe of output is a running program, not an end"
     );
 }

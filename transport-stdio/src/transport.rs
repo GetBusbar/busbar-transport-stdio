@@ -74,7 +74,7 @@ fn emptied(buf: &mut Vec<u8>) {
 
 /// Why a member's dial is refused while its program is held down.
 pub const HELD_DOWN: &str =
-    "dial: the program keeps ending; its restarts are held down by the stdio supervisor";
+    "dial: the program keeps ending or failing to start; its restarts are held down by the stdio supervisor";
 /// Why a member's dial fails when the host's clock does not answer (none lent, or it failed): a
 pub const NO_CLOCK: &str =
     "dial: the host's clock did not answer; a member's program is not run unsupervised";

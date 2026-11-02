@@ -15,7 +15,10 @@ use crate::transport::{
     Accept, Adopt, Arrival, Begin, Carried, Detach, Dial, Emit, Encode, Finish, Flush, Ingest,
     Listen, Locate, Read, RefuseFrame, Shut, Timer, Write,
 };
-pub use crate::transport::{FRAME_TOO_LONG, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, TOO_LONG};
+pub use crate::transport::{
+    FRAME_TOO_LONG, HELD_DOWN, MAX_LINE_BYTES, MAX_QUEUED_BYTES, NOT_A_COUNT, NOT_ONE_LINE,
+    NO_CLOCK, TOO_LONG,
+};
 
 busbar_contract::statement_extensions!(
     /// The Statement's extensions: this plugin's whole `declares` document.
