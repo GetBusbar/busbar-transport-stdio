@@ -39,7 +39,7 @@ use busbar_contract::abi::transport::{
     slot, ConnIn, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, WriteIn, DEST_PROGRAM,
     WRITE_END_OF_FRAME,
 };
-use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, NO_CLOCK, TOO_LONG};
+use busbar_transport_stdio::door::{door, HELD_DOWN, MAX_LINE_BYTES, NO_CLOCK, TOO_LONG};
 
 const MS: u64 = 1_000_000;
 
@@ -350,10 +350,7 @@ impl Carrier {
     fn assert_held_down(&self, key: u64, token: &str, msg: &str) {
         let (r, _, why) = self.dial_why(key, token);
         assert_eq!(r, Outcome::Refused, "{msg}");
-        assert!(
-            why.contains("held down"),
-            "{msg}: the reason is the hold-down: {why:?}"
-        );
+        assert_eq!(why, HELD_DOWN, "{msg}: the reason is the hold-down");
     }
 
     /// Write one whole frame to `conn`.
