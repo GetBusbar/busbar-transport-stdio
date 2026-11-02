@@ -760,9 +760,9 @@ fn a_program_that_exited_behind_a_full_pipe_is_found_ended_at_its_shut() {
     );
 }
 
-/// A program with more output than a full pipe (the probe's bound, plus the read that would find
-/// its end) is still running: its clean shut is not an end, and the probe does not read it to its
-/// end.
+/// A program whose output fills the probe's whole bound (a full pipe plus one read) is still
+/// running: the end read is the first one past the bound, so its clean shut is not an end and the
+/// probe does not read it to its end.
 #[test]
 fn a_program_with_more_than_a_full_pipe_of_output_is_running_at_its_shut() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -771,7 +771,7 @@ fn a_program_with_more_than_a_full_pipe_of_output_is_running_at_its_shut() {
     assert_eq!(r, Outcome::Ready);
     with(|sc| {
         sc.ended = true;
-        sc.flood = 1024 * 1024 / (16 * 1024) + 2;
+        sc.flood = 1024 * 1024 / (16 * 1024) + 1;
     });
     c.shut(conn);
     assert_eq!(
