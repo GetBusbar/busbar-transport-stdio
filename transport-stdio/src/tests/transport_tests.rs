@@ -4,8 +4,7 @@
 use super::*;
 
 /// A connection's buffers give back what one large line grew them to once it is answered: a
-/// long-lived member connection holds a working size, not the high-water mark of its largest
-/// message. RED (row 159, stdio LOW): `clear` kept the capacity for the life of the program.
+
 #[test]
 fn an_answered_line_gives_back_what_it_grew_the_buffer_to() {
     let mut inbound = vec![b'x'; 4 * 1024 * 1024];
@@ -25,8 +24,7 @@ fn an_answered_line_gives_back_what_it_grew_the_buffer_to() {
 }
 
 /// Compacting gives back what a large line grew the buffer to while the next line is still
-/// arriving: lines split across reads never wholly empty the buffer. RED (codeaudit 0aa4f6d,
-/// stdio LOW): compact kept the high-water capacity while lines kept arriving split across reads.
+
 #[test]
 fn a_compacted_buffer_gives_back_what_a_large_line_grew_it_to() {
     let mut inbound = vec![b'x'; 4 * 1024 * 1024];
@@ -48,9 +46,7 @@ fn a_compacted_buffer_gives_back_what_a_large_line_grew_it_to() {
 }
 
 /// An op that took a connection out of the table before its shut, and waited for its lock while
-/// the shut closed it, finds it gone as an op after the shut does: it never runs on the closed
-/// handle, so a failure there never books a clean shut as the program's end. RED (codeaudit
-/// 94ae3e3, stdio ST-C1 LOW): the late op locked the shut connection and ran on it.
+
 #[test]
 fn an_op_that_took_a_connection_before_its_shut_finds_it_gone() {
     let carried = Carried::open(b"", &[], 0).unwrap();
@@ -70,8 +66,7 @@ fn an_op_that_took_a_connection_before_its_shut_finds_it_gone() {
 }
 
 /// A dial sweeps out every key whose supervisor holds nothing (it reads as a fresh one), so the
-/// carrier holds only members inside their window or held down, not one entry per member it ever
-/// ran. RED (codeaudit 94ae3e3, stdio tests LOW): only `Supervisor::idle` was tested, not the sweep.
+
 #[test]
 fn a_dial_drops_the_supervision_of_every_idle_member() {
     let carried = Carried::open(b"", &[], 0).unwrap();

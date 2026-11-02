@@ -2,17 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `stdio` DOOR: this transport as a CARRIER on the transport kind's table
-//! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door. Every slot
-//! is a [`SafeSlot`](busbar_contract::abi::sdk::SafeSlot) over the SDK's generic lifecycle
-//! (`life(Carried)`): no `unsafe` here.
-//!
-//! The program and its pipes are the host's: this carrier spawns,
-//! reads, writes and closes through the host's I/O (`io.*`) and owns the line semantics over them
-//! ([`crate::transport`]): one frame per line in, one line per frame out. `listen`, `accept` and
-//! every framer op are REFUSED.
-//!
-//! The door wires the kind's own files together: the key and tail [`crate::meta`] declares, the
-//! claims [`crate::claims`] declares, and the carrier [`crate::transport`] runs.
 
 use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;

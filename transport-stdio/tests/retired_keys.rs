@@ -17,7 +17,6 @@ use busbar_contract::abi::transport::{
     WRITE_END_OF_FRAME,
 };
 
-// DEST_RETIRED is wire kind 2 in the existing core contract; the pinned dev.2 SDK predates its name.
 const RETIRED: u32 = 2;
 static ONE: Mutex<()> = Mutex::new(());
 static SCRIPT: Mutex<Option<Script>> = Mutex::new(None);

@@ -7,11 +7,11 @@ use super::*;
 fn a_delayed_end_notification_does_not_shorten_an_existing_hold_down() {
     let mut s = Supervisor::default();
     s.crashed(5_000 * MS);
-    // Another caller sampled the clock earlier, then waited for the supervisor's lock.
+
     s.crashed(4_000 * MS);
     assert!(!s.may_restart(5_100 * MS - 1));
     assert!(s.may_restart(5_100 * MS));
-    // The delayed notification is still counted in the existing window.
+
     s.crashed(5_100 * MS);
     assert!(!s.may_restart(5_500 * MS - 1));
     assert!(s.may_restart(5_500 * MS));
@@ -42,7 +42,7 @@ fn a_delayed_end_exactly_at_the_latest_window_boundary_still_counts() {
 }
 
 /// The crash-loop policy of predev's connector, figure for figure: a backoff doubling from 100 ms,
-/// and the fifth end inside a minute stopping the restarts for good.
+
 #[test]
 fn the_backoff_doubles_and_the_fifth_end_in_a_minute_trips() {
     let mut s = Supervisor::default();
@@ -65,7 +65,7 @@ fn the_backoff_doubles_and_the_fifth_end_in_a_minute_trips() {
 }
 
 /// Ends outside the window are forgotten: four ends, a quiet minute, and the next end restarts
-/// the count.
+
 #[test]
 fn ends_outside_the_window_are_forgotten() {
     let mut s = Supervisor::default();
@@ -95,8 +95,7 @@ fn an_end_exactly_one_window_old_still_counts_and_is_not_idle() {
 }
 
 /// A supervisor holding no end inside the window and no pending backoff is idle (it reads as a
-/// fresh one, so its key's state may be dropped); a tripped one never is. RED (Q128
-/// transport-stdio LOW): the carrier kept every key's state for good.
+
 #[test]
 fn a_supervisor_with_nothing_to_hold_is_idle_and_a_tripped_one_is_not() {
     let mut s = Supervisor::default();

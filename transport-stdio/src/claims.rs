@@ -2,8 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The claims this transport declares:
-//! the schemes it answers for and, for each, the facts the root reads per scheme. A declaration and
-//! nothing else, read once at registration.
 
 use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::sdk::door::abi_str;
@@ -13,8 +11,7 @@ use busbar_contract::abi::transport::{Claim, UNIT0_FIRST_LINE};
 pub(crate) const CLAIM_NAMES: &[AbiStr] = &[abi_str(crate::meta::KEY)];
 
 /// The claim's row: no selector forms (a stdio channel has no surface to select on), a session
-/// whose first unit opens on its first line. `session_bound` tells the host to cache the
-/// principal for that session; this carrier itself neither reads nor stores a principal.
+
 pub(crate) const CLAIMS: &[Claim] = &[{
     let mut c = Claim::EMPTY;
     c.selector_forms = abi_str("");
