@@ -1164,7 +1164,7 @@ fn open(p: &Plugin<Transport>) {
     f.input.settings = Blob::json(b"{}");
     assert_eq!(p.call(life::OPEN, &mut f).outcome, Outcome::Ready);
 }
-#[path = "negative.rs.inc"]
+#[path = "support/negative.rs"]
 mod negative;
 #[test]
 fn the_suite_runs_in_the_profile_it_was_asked_to() {
