@@ -42,7 +42,6 @@ fn a_delayed_end_exactly_at_the_latest_window_boundary_still_counts() {
 }
 
 /// The crash-loop policy of predev's connector, figure for figure: a backoff doubling from 100 ms,
-
 #[test]
 fn the_backoff_doubles_and_the_fifth_end_in_a_minute_trips() {
     let mut s = Supervisor::default();
@@ -65,7 +64,6 @@ fn the_backoff_doubles_and_the_fifth_end_in_a_minute_trips() {
 }
 
 /// Ends outside the window are forgotten: four ends, a quiet minute, and the next end restarts
-
 #[test]
 fn ends_outside_the_window_are_forgotten() {
     let mut s = Supervisor::default();
@@ -95,7 +93,6 @@ fn an_end_exactly_one_window_old_still_counts_and_is_not_idle() {
 }
 
 /// A supervisor holding no end inside the window and no pending backoff is idle (it reads as a
-
 #[test]
 fn a_supervisor_with_nothing_to_hold_is_idle_and_a_tripped_one_is_not() {
     let mut s = Supervisor::default();

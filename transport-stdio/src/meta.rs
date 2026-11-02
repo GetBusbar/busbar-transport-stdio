@@ -17,7 +17,6 @@ pub const KEY: &str = "stdio";
 pub(crate) const SESSION: bool = true;
 
 /// The one setting this transport reads: the deployment's request-body bound, its line ceiling (a
-
 pub(crate) const SETTING_ROWS: [SettingRow; 1] = [SettingRow {
     path: BODY_MAX_BYTES,
     kind: SETTING_COUNT,

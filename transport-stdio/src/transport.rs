@@ -26,19 +26,15 @@ use busbar_contract::carried;
 use busbar_contract::transport::registry::DEFAULT_REQUEST_BODY_MAX_BYTES;
 
 /// The setting this carrier reads: the deployment's request-body bound, which
-
 pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 
 /// The line ceiling when the host hands no [`BODY_MAX_BYTES`]: the host's own default request-body
-
 pub const MAX_LINE_BYTES: usize = DEFAULT_REQUEST_BODY_MAX_BYTES;
 
 /// The queued bytes past which a `write` takes nothing more and waits for the pipe to drain. It
-
 pub const MAX_QUEUED_BYTES: usize = 256 * 1024;
 
 /// The capacity a connection's buffer keeps once it is empty: what one large message grew it past
-
 const KEEP_BYTES: usize = 256 * 1024;
 
 /// How many bytes one pipe read takes.
@@ -52,7 +48,6 @@ pub const NOT_A_COUNT: &str =
 const SDK_NOT_A_COUNT: &str = "settings: limits.request_body_max_bytes must be a count above 0";
 
 /// The line ceiling `settings` states: its [`BODY_MAX_BYTES`], or [`MAX_LINE_BYTES`] when it states
-
 fn ceiling(settings: &[u8]) -> Result<usize, Refusal> {
     let settings = settings_reading(settings, &crate::meta::SETTING_ROWS).map_err(|refusal| {
         if refusal.text() == Some(SDK_NOT_A_COUNT) {
@@ -81,20 +76,16 @@ fn emptied(buf: &mut Vec<u8>) {
 pub const HELD_DOWN: &str =
     "dial: the program keeps ending; its restarts are held down by the stdio supervisor";
 /// Why a member's dial fails when the host's clock does not answer (none lent, or it failed): a
-
 pub const NO_CLOCK: &str =
     "dial: the host's clock did not answer; a member's program is not run unsupervised";
 
 /// The most output a program that exited can have left unread: one full pipe. The host reads the
-
 const PIPE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Reads a program's output may take to find its end at a shut, at most: a full pipe, then the read
-
 const SHUT_PROBE_READS: usize = PIPE_MAX_BYTES / READ_CHUNK + 1;
 
 /// Check the parent process independently of inherited pipes, then use the pipe probe as a
-
 fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
     if matches!(io.program_exit(handle), Ok(Some(_))) {
         return true;
@@ -130,7 +121,6 @@ struct Line {
 }
 
 /// What one instance carries: its connections, each by the token it minted, the supervision of
-
 pub struct Carried {
     conns: Mutex<HashMap<u64, Arc<Mutex<Conn>>>>,
     next: AtomicU64,
@@ -199,7 +189,6 @@ impl Life for Carried {
     }
 
     /// `close` (the instance's): every connection handle still held is closed through the host's
-
     fn close(&self, host: Option<&Host>) {
         let conns: Vec<_> = lock(&self.conns).drain().map(|(_, c)| c).collect();
         if let Some(mut io) = host.map(|h| h.io(Ticket::NONE)).filter(Io::armed) {
@@ -220,7 +209,6 @@ impl Carried {
     }
 
     /// The connection `token`, taken out of the table for its shut and marked shut under its lock:
-
     fn forget(&self, token: u64) -> Option<Arc<Mutex<Conn>>> {
         let held = lock(&self.conns).remove(&token)?;
         lock(&held).shut = true;
@@ -228,7 +216,6 @@ impl Carried {
     }
 
     /// The program under `c.key` ended at `now`: counted once per supervised connection.
-
     fn ended(&self, c: &mut Conn, now: Option<u64>) {
         if c.key == 0 || c.counted {
             return;
@@ -244,14 +231,12 @@ impl Carried {
     }
 
     /// An op on the member's connection failed on its program's side (a failed pipe, a line past
-
     fn faulted(&self, c: &mut Conn, now: Option<u64>) {
         c.faulted = true;
         self.ended(c, now);
     }
 
     /// Whether the member `key`'s program is held down at `at`. A key whose state holds nothing
-
     fn held_down(&self, key: u64, at: u64) -> bool {
         let mut supervised = lock(&self.supervised);
         supervised.retain(|_, s| !s.idle(at));
@@ -265,7 +250,6 @@ impl Carried {
 }
 
 /// The host's monotonic clock now (one clock, lent to transports); `None`
-
 fn now(i: &Instance<'_, State>) -> Option<u64> {
     let services = i.get()?.host()?.services()?;
     let handle = CompletionHandle {
@@ -285,7 +269,6 @@ fn refusal(e: &IoFailure) -> Refusal {
 }
 
 /// The connection an op took out of the table, locked; `None` when it was shut while the op waited
-
 fn live(conn: &Mutex<Conn>) -> Option<MutexGuard<'_, Conn>> {
     let c = lock(conn);
     (!c.shut).then_some(c)
@@ -310,7 +293,6 @@ macro_rules! over {
 
 impl Conn {
     /// The next whole line in `inbound` (the newline and a carriage return before it stripped);
-
     fn next_line(&mut self, max: usize) -> Result<Option<Line>, &'static str> {
         let from = self.scanned.max(self.head);
         match self.inbound[from..].iter().position(|&b| b == b'\n') {
@@ -352,7 +334,6 @@ impl Conn {
     }
 
     /// The line answered: the bytes after it are next. Answered bytes are dropped once nothing is
-
     fn answered(&mut self, next: usize) {
         self.line = None;
         self.head = next;
@@ -364,7 +345,6 @@ impl Conn {
     }
 
     /// Room for the next pipe read: the answered bytes leave the front of `inbound`, and the
-
     fn compact(&mut self) {
         if self.head > 0 {
             self.inbound.drain(..self.head);
@@ -557,7 +537,6 @@ impl SafeSlot for Read {
 }
 
 /// `write`: a frame's bytes gathered until its end, then queued as one line and written as far as
-
 pub struct Write;
 impl SafeSlot for Write {
     type In = WriteIn;
@@ -634,7 +613,6 @@ impl SafeSlot for Flush {
 }
 
 /// `shut`: the handle is closed (the host kills the program) and the connection forgotten. An
-
 pub struct Shut;
 impl SafeSlot for Shut {
     type In = ShutIn;

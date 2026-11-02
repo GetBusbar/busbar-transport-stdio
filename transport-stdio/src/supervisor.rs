@@ -50,7 +50,6 @@ impl Supervisor {
     }
 
     /// Whether it holds nothing at `now`: no end inside the window, no backoff pending, not
-
     pub fn idle(&self, now: u64) -> bool {
         self.may_restart(now)
             && self

@@ -11,7 +11,6 @@ use busbar_contract::abi::transport::{Claim, UNIT0_FIRST_LINE};
 pub(crate) const CLAIM_NAMES: &[AbiStr] = &[abi_str(crate::meta::KEY)];
 
 /// The claim's row: no selector forms (a stdio channel has no surface to select on), a session
-
 pub(crate) const CLAIMS: &[Claim] = &[{
     let mut c = Claim::EMPTY;
     c.selector_forms = abi_str("");

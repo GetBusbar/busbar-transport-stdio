@@ -337,7 +337,6 @@ impl Host {
     }
 
     /// A read into the caller's buffer: the outcome, the bytes answered and the frame bit, and no
-
     fn read_into(&self, buf: &mut [u8]) -> (Outcome, usize, bool) {
         let mut i: ReadIn = z();
         i.conn = self.conn;
@@ -390,7 +389,6 @@ fn the_tail_is_a_carrier_composing_over_nothing() {
 }
 
 /// The claim row states the facts the root reads for a stdio session: a session, bound to its
-
 #[test]
 fn the_claim_row_states_a_line_session_and_the_linked_entry_agrees() {
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
@@ -589,7 +587,6 @@ fn a_frame_goes_out_as_one_line_and_one_that_cannot_be_one_is_refused() {
 }
 
 /// A frame refused while it was gathered (it holds a newline, or it ran past the ceiling) leaves
-
 #[test]
 fn a_refused_frame_leaves_nothing_gathered_for_the_next() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -645,7 +642,6 @@ fn shut_closes_the_program_and_an_authority_or_a_listen_is_refused() {
 }
 
 /// A buffered line and a complete frame allocate nothing once connection buffers are warm.
-
 #[test]
 fn a_buffered_line_and_a_whole_frame_allocate_nothing() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -673,7 +669,6 @@ fn a_buffered_line_and_a_whole_frame_allocate_nothing() {
 }
 
 /// A LINE OF 100 KiB IS ONE FRAME: the carrier's line bound is the host's own bound on one
-
 #[test]
 fn a_line_of_a_hundred_kib_is_one_frame() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -692,7 +687,6 @@ fn a_line_of_a_hundred_kib_is_one_frame() {
 }
 
 /// A FRAME IS BOUNDED LIKE A LINE: the bytes gathered for one outbound frame stop at the line
-
 #[test]
 fn a_gathered_frame_past_the_line_ceiling_fails() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -709,7 +703,6 @@ fn a_gathered_frame_past_the_line_ceiling_fails() {
 }
 
 /// THE LINE CEILING IS THE OPERATOR'S REQUEST-BODY BOUND: the tail declares the one setting the
-
 #[test]
 fn the_tail_declares_the_request_body_bound_it_reads() {
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
@@ -724,7 +717,6 @@ fn the_tail_declares_the_request_body_bound_it_reads() {
 }
 
 /// A deployment's request-body bound is the line ceiling both ways: a line or a frame of exactly
-
 #[test]
 fn the_line_ceiling_is_the_deployments_request_body_bound() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -750,7 +742,6 @@ fn the_line_ceiling_is_the_deployments_request_body_bound() {
 }
 
 /// A deployment that RAISED the bound past the default carries a line past the default whole.
-
 #[test]
 fn a_raised_request_body_bound_carries_a_line_past_the_default() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -803,7 +794,6 @@ fn a_refresh_lowers_and_raises_the_read_ceiling_on_an_existing_connection() {
 }
 
 /// A bound that is no count of bytes is FAILED at `validate`, before any instance opens on it:
-
 #[test]
 fn a_request_body_bound_that_is_no_count_fails_validation() {
     for bound in ["\"big\"", "-1", "1.5", "null"] {
@@ -827,7 +817,6 @@ fn a_request_body_bound_that_is_no_count_fails_validation() {
 }
 
 /// An op on a connection that is gone FAILS: after the shut, a read and a write find no such
-
 #[test]
 fn a_read_or_write_on_a_shut_connection_fails() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -872,7 +861,6 @@ fn arrival_answers_for_a_live_connection_only() {
 }
 
 /// A line of exactly the ceiling ended by CRLF is one frame whichever read its CR and its LF
-
 #[test]
 fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -892,7 +880,6 @@ fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
 }
 
 /// A SLOW READER'S QUEUE IS BOUNDED: a program that reads stdin slower than frames arrive leaves the
-
 #[test]
 fn a_program_that_reads_slower_than_frames_arrive_holds_a_bounded_queue() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1165,7 +1152,6 @@ fn the_statement_carries_the_declares_document() {
 }
 
 /// `arrival` with no open instance says so, in the op's own words (the same as tcp's), and an
-
 #[test]
 fn arrival_with_no_instance_says_no_open_instance() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);

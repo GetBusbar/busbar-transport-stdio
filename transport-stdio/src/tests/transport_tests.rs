@@ -4,7 +4,6 @@
 use super::*;
 
 /// A connection's buffers give back what one large line grew them to once it is answered: a
-
 #[test]
 fn an_answered_line_gives_back_what_it_grew_the_buffer_to() {
     let mut inbound = vec![b'x'; 4 * 1024 * 1024];
@@ -24,7 +23,6 @@ fn an_answered_line_gives_back_what_it_grew_the_buffer_to() {
 }
 
 /// Compacting gives back what a large line grew the buffer to while the next line is still
-
 #[test]
 fn a_compacted_buffer_gives_back_what_a_large_line_grew_it_to() {
     let mut inbound = vec![b'x'; 4 * 1024 * 1024];
@@ -46,7 +44,6 @@ fn a_compacted_buffer_gives_back_what_a_large_line_grew_it_to() {
 }
 
 /// An op that took a connection out of the table before its shut, and waited for its lock while
-
 #[test]
 fn an_op_that_took_a_connection_before_its_shut_finds_it_gone() {
     let carried = Carried::open(b"", &[], 0).unwrap();
@@ -66,7 +63,6 @@ fn an_op_that_took_a_connection_before_its_shut_finds_it_gone() {
 }
 
 /// A dial sweeps out every key whose supervisor holds nothing (it reads as a fresh one), so the
-
 #[test]
 fn a_dial_drops_the_supervision_of_every_idle_member() {
     let carried = Carried::open(b"", &[], 0).unwrap();
