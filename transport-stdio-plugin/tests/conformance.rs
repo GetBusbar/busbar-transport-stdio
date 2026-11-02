@@ -759,6 +759,17 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         if refused {
             continue;
         }
+        // WRITE accepts a frame into the carrier's queue; FLUSH puts it on the actual pipe.
+        {
+            let before = counts(&p);
+            let answer = flush(&p, &wr, conn);
+            let after = counts(&p);
+            let crossed = after.0 - before.0;
+            let resumed = after.1 - before.1;
+            assert_eq!(crossed, 1, "flush #{n}");
+            assert_eq!(answer, "Ready err=\"\"", "flush #{n}");
+            results.push((format!("flush #{n}"), answer, crossed, resumed));
+        }
         if let Some(h) = made {
             let _ = h;
             std::thread::sleep(Duration::from_millis(100));
@@ -835,6 +846,21 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
             resumed,
         ));
     };
+    {
+        let before = counts(&p);
+        let answer = flush(&p, &wr, conn);
+        let after = counts(&p);
+        let crossed = after.0 - before.0;
+        let resumed = after.1 - before.1;
+        assert_eq!(crossed, 1, "flush while a read pends");
+        assert_eq!(answer, "Ready err=\"\"", "flush while a read pends");
+        results.push((
+            "flush while a read pends".to_string(),
+            answer,
+            crossed,
+            resumed,
+        ));
+    }
     {
         let before = counts(&p);
         let answer = format!("{}", woken(&host, &rd));
