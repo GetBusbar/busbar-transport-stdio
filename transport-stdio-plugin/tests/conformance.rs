@@ -322,7 +322,7 @@ fn shut(p: &Plugin<Transport>, side: &Side, conn: u64) -> String {
     format!("{:?}", c.outcome)
 }
 
-fn woken(host: &HostIo, side: &Side) -> bool {
+fn woken(_host: &HostIo, side: &Side) -> bool {
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         if side.woken.0.swap(false, Ordering::SeqCst) {
@@ -402,7 +402,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
 
     {
         let before = counts(&p);
-        let answer = (|| dial(&p, &wr, &Dest::authority("127.0.0.1:1")).0)();
+        let answer = dial(&p, &wr, &Dest::authority("127.0.0.1:1")).0;
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -447,7 +447,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     );
     {
         let before = counts(&p);
-        let answer = (|| framer_ops(&p, &wr))();
+        let answer = framer_ops(&p, &wr);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -473,7 +473,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     };
     let (listener, bound) = {
         let before = counts(&p);
-        let (answer, value) = (|| {
+        let (answer, value) = {
             let mut i: ListenIn = input();
             i.bind = abi(bind_at);
             i.addr_buf = addr.as_mut_ptr();
@@ -485,7 +485,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
                 other => format!("{other:?}"),
             };
             (line, (o.listener, bound))
-        })();
+        };
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -505,7 +505,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         let mut peer = vec![0_u8; MAX_ADDR as usize];
         let accepted = {
             let before = counts(&p);
-            let (answer, value) = (|| {
+            let (answer, value) = {
                 let mut i: AcceptIn = input();
                 i.listener = listener;
                 i.peer_buf = peer.as_mut_ptr();
@@ -522,7 +522,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
                 let o = frame.out;
                 let at = lossy(&peer[..(o.peer_written as usize).min(peer.len())]);
                 (format!("{:?} peer={}", c.outcome, unported(&at)), o.conn)
-            })();
+            };
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -539,7 +539,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         let want = is("Ready peer=127.0.0.1:* local_port_is_bound=true");
         {
             let before = counts(&p);
-            let answer = (|| {
+            let answer = {
                 let mut peer = vec![0_u8; MAX_ADDR as usize];
                 let mut i: ArrivalIn = input();
                 i.conn = accepted;
@@ -553,7 +553,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
                     c.outcome,
                     unported(&at)
                 )
-            })();
+            };
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -573,7 +573,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         let want = is("Ready bytes=\"from the far end\" end_of_frame=true");
         {
             let before = counts(&p);
-            let answer = (|| read(&p, &rd, accepted, false))();
+            let answer = read(&p, &rd, accepted, false);
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -591,7 +591,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         };
         {
             let before = counts(&p);
-            let answer = (|| write(&p, &wr, accepted, b"to the far end"))();
+            let answer = write(&p, &wr, accepted, b"to the far end");
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -611,7 +611,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         let ok = far.read_exact(&mut got).is_ok() && &got == b"to the far end";
         {
             let before = counts(&p);
-            let answer = (|| format!("{ok}"))();
+            let answer = format!("{ok}");
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -626,7 +626,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         };
         {
             let before = counts(&p);
-            let answer = (|| shut(&p, &wr, accepted))();
+            let answer = shut(&p, &wr, accepted);
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -646,7 +646,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         let ended = far.read_to_end(&mut rest).is_ok() && rest.is_empty();
         {
             let before = counts(&p);
-            let answer = (|| format!("{ended}"))();
+            let answer = format!("{ended}");
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -689,7 +689,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     };
     let conn = {
         let before = counts(&p);
-        let (answer, value) = (|| dial(&p, &wr, &dest))();
+        let (answer, value) = dial(&p, &wr, &dest);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -703,7 +703,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     };
     {
         let before = counts(&p);
-        let answer = (|| flush(&p, &wr, conn))();
+        let answer = flush(&p, &wr, conn);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -730,7 +730,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         };
         {
             let before = counts(&p);
-            let answer = (|| write(&p, &wr, conn, frame.as_bytes()))();
+            let answer = write(&p, &wr, conn, frame.as_bytes());
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -763,7 +763,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         let want = Want::Is(format!("Ready bytes={answer:?} end_of_frame=true"));
         {
             let before = counts(&p);
-            let answer = (|| read(&p, &rd, conn, false))();
+            let answer = read(&p, &rd, conn, false);
             let after = counts(&p);
             let crossed = after.0 - before.0;
             let resumed = after.1 - before.1;
@@ -793,7 +793,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     rd.woken.0.store(false, Ordering::SeqCst);
     {
         let before = counts(&p);
-        let answer = (|| read_once(&p, &rd, conn, false))();
+        let answer = read_once(&p, &rd, conn, false);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -809,7 +809,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     let want = Want::Is(format!("Ready len={}", frame.len()));
     {
         let before = counts(&p);
-        let answer = (|| write(&p, &wr, conn, frame.as_bytes()))();
+        let answer = write(&p, &wr, conn, frame.as_bytes());
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -832,7 +832,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     };
     {
         let before = counts(&p);
-        let answer = (|| format!("{}", woken(&host, &rd)))();
+        let answer = format!("{}", woken(&host, &rd));
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -858,7 +858,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     let want = Want::Is(format!("Ready bytes={answer:?} end_of_frame=true"));
     {
         let before = counts(&p);
-        let answer = (|| read(&p, &rd, conn, true))();
+        let answer = read(&p, &rd, conn, true);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -873,7 +873,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     };
     {
         let before = counts(&p);
-        let answer = (|| shut(&p, &wr, conn))();
+        let answer = shut(&p, &wr, conn);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -886,7 +886,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     };
     {
         let before = counts(&p);
-        let answer = (|| shut(&p, &wr, conn))();
+        let answer = shut(&p, &wr, conn);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -907,7 +907,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     };
     {
         let before = counts(&p);
-        let answer = (|| dial(&p, &guarded, &unadmitted).0)();
+        let answer = dial(&p, &guarded, &unadmitted).0;
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -933,7 +933,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     );
     {
         let before = counts(&p);
-        let answer = (|| dial(&p, &other_side, &other).0)();
+        let answer = dial(&p, &other_side, &other).0;
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -959,7 +959,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
 
     {
         let before = counts(&p);
-        let answer = (|| program_exit(&host))();
+        let answer = program_exit(&host);
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -988,7 +988,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
 
     {
         let before = counts(&p);
-        let answer = (|| dial(&p, &wr, &Dest::authority("127.0.0.1:1")).0)();
+        let answer = dial(&p, &wr, &Dest::authority("127.0.0.1:1")).0;
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
@@ -1007,7 +1007,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
 
     {
         let before = counts(&p);
-        let answer = (|| format!("{}", host.held() == usize::from(host_listener.is_some())))();
+        let answer = format!("{}", host.held() == usize::from(host_listener.is_some()));
         let after = counts(&p);
         let crossed = after.0 - before.0;
         let resumed = after.1 - before.1;
