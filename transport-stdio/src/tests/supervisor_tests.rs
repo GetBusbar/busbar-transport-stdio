@@ -17,6 +17,30 @@ fn a_delayed_end_notification_does_not_shorten_an_existing_hold_down() {
     assert!(s.may_restart(5_500 * MS));
 }
 
+#[test]
+fn a_delayed_end_outside_the_latest_window_does_not_trip_or_extend_the_hold_down() {
+    let mut s = Supervisor::default();
+    let latest = 2 * CRASH_WINDOW_NS;
+    for _ in 0..CRASH_THRESHOLD - 1 {
+        s.crashed(latest);
+    }
+    s.crashed(0);
+    assert!(!s.may_restart(latest + 800 * MS - 1));
+    assert!(s.may_restart(latest + 800 * MS));
+    assert!(s.idle(latest + CRASH_WINDOW_NS + 1));
+}
+
+#[test]
+fn a_delayed_end_exactly_at_the_latest_window_boundary_still_counts() {
+    let mut s = Supervisor::default();
+    let latest = 2 * CRASH_WINDOW_NS;
+    for _ in 0..CRASH_THRESHOLD - 1 {
+        s.crashed(latest);
+    }
+    s.crashed(latest - CRASH_WINDOW_NS);
+    assert!(!s.may_restart(latest + 3_600_000 * MS));
+}
+
 /// The crash-loop policy of predev's connector, figure for figure: a backoff doubling from 100 ms,
 /// and the fifth end inside a minute stopping the restarts for good.
 #[test]

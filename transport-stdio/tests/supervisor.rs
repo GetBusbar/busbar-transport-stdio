@@ -21,6 +21,7 @@
 //!
 //! RED before the supervisor moved here: the carrier spawned whatever it was asked to, every time.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::sync::{Mutex, PoisonError};
@@ -87,6 +88,8 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
 struct Script {
     /// The host's monotonic clock, nanoseconds.
     mono_ns: u64,
+    /// Clock snapshots delivered late after other connection notifications acquired the lock.
+    clock_snapshots: VecDeque<u64>,
     /// Whether the next spawn fails.
     spawn_fails: bool,
     /// Whether the next spawn is REFUSED by the host's policy (not a system failure).
@@ -114,10 +117,16 @@ struct Script {
     write_fails: bool,
     /// Whether a pipe write answers PENDING (the program reads nothing yet).
     write_pends: bool,
+    /// Explicit successful write counts; after these, writes take the full offered suffix.
+    write_counts: VecDeque<usize>,
+    write_calls: usize,
+    written: Vec<u8>,
+    closed: Vec<u64>,
 }
 
 static SCRIPT: Mutex<Script> = Mutex::new(Script {
     mono_ns: 1_000 * MS,
+    clock_snapshots: VecDeque::new(),
     spawn_fails: false,
     spawn_refused: false,
     spawn_elapsed_ns: 0,
@@ -131,6 +140,10 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     flood: 0,
     write_fails: false,
     write_pends: false,
+    write_counts: VecDeque::new(),
+    write_calls: 0,
+    written: Vec::new(),
+    closed: Vec::new(),
 });
 static ONE: Mutex<()> = Mutex::new(());
 
@@ -185,19 +198,31 @@ extern "C" fn io_read(_: HostCtx, input: *const c_void, out: *mut ServiceOut) ->
 extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
     let i = unsafe { input.cast::<IoWriteIn>().read() };
-    let (fails, pends) = with(|sc| (sc.write_fails, sc.write_pends));
+    let (fails, pends) = with(|sc| {
+        sc.write_calls += 1;
+        (sc.write_fails, sc.write_pends)
+    });
     if fails {
         answer(out, Outcome::Failed, 0, 0)
     } else if pends {
         answer(out, Outcome::Pending, 0, 0)
     } else {
-        answer(out, Outcome::Ready, 0, i.len as u64)
+        let n = with(|sc| {
+            let n = sc.write_counts.pop_front().unwrap_or(i.len);
+            assert!(n <= i.len);
+            // SAFETY: the carrier lends exactly these initialized bytes during this call.
+            let bytes = unsafe { std::slice::from_raw_parts(i.bytes, n) };
+            sc.written.extend_from_slice(bytes);
+            n
+        });
+        answer(out, Outcome::Ready, 0, n as u64)
     }
 }
 
 extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
-    let _ = unsafe { input.cast::<HandleIn>().read() };
+    let i = unsafe { input.cast::<HandleIn>().read() };
+    with(|sc| sc.closed.push(i.handle));
     answer(out, Outcome::Ready, 0, 0)
 }
 
@@ -215,7 +240,7 @@ extern "C" fn clock_now(_: HostCtx, input: *const c_void, out: *mut ServiceOut) 
     unsafe {
         let i = input.cast::<ClockNowIn>().read();
         (*i.reading).wall_ns = 1_700_000_000_000_000_000;
-        (*i.reading).mono_ns = with(|sc| sc.mono_ns);
+        (*i.reading).mono_ns = with(|sc| sc.clock_snapshots.pop_front().unwrap_or(sc.mono_ns));
     }
     answer(out, Outcome::Ready, 0, 0)
 }
@@ -261,6 +286,7 @@ impl Carrier {
     fn with_exit_reporting(report_exits: bool) -> Self {
         *SCRIPT.lock().unwrap_or_else(PoisonError::into_inner) = Script {
             mono_ns: 1_000 * MS,
+            clock_snapshots: VecDeque::new(),
             spawn_fails: false,
             spawn_refused: false,
             spawn_elapsed_ns: 0,
@@ -274,6 +300,10 @@ impl Carrier {
             flood: 0,
             write_fails: false,
             write_pends: false,
+            write_counts: VecDeque::new(),
+            write_calls: 0,
+            written: Vec::new(),
+            closed: Vec::new(),
         };
         let io = Box::new(IoSlots {
             ends: report_exits.then_some(io_ends),
@@ -383,13 +413,25 @@ impl Carrier {
 
     /// Write one whole frame to `conn`.
     fn write_frame(&self, conn: u64, bytes: &[u8]) -> Outcome {
+        self.write_frame_why(conn, bytes).0
+    }
+
+    fn write_frame_why(&self, conn: u64, bytes: &[u8]) -> (Outcome, String) {
         let mut i: WriteIn = z();
         i.conn = conn;
         i.bytes = bytes.as_ptr();
         i.len = bytes.len();
         i.flags = WRITE_END_OF_FRAME;
         let mut o: IoOut = z();
-        call(ops().write, self.inst, &mut i, &mut o, slot::WRITE)
+        let r = call(ops().write, self.inst, &mut i, &mut o, slot::WRITE);
+        let why = if o.head.error.len == 0 {
+            String::new()
+        } else {
+            // SAFETY: the carrier's error bytes remain live until release or instance close.
+            let bytes = unsafe { std::slice::from_raw_parts(o.head.error.ptr, o.head.error.len) };
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        (r, why)
     }
 
     /// Flush `conn`.
@@ -665,6 +707,97 @@ fn a_failed_flush_is_an_end() {
     c.assert_held_down(6, "a", "still held down after the shut");
 }
 
+#[test]
+fn positive_writes_and_a_pending_queue_flush_preserve_every_byte_and_close_once() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    with(|sc| sc.ended = false);
+    let (outcome, conn) = c.dial(90, "a");
+    assert_eq!(outcome, Outcome::Ready);
+    assert_eq!(c.write_frame(conn, b"first"), Outcome::Ready);
+    with(|sc| sc.write_pends = true);
+    assert_eq!(c.write_frame(conn, b"second"), Outcome::Ready);
+    assert_eq!(c.flush(conn), Outcome::Pending);
+    with(|sc| {
+        sc.write_pends = false;
+        sc.write_counts = [2, 1].into();
+    });
+    assert_eq!(c.flush(conn), Outcome::Ready);
+    with(|sc| assert_eq!(sc.written, b"first\nsecond\n"));
+    c.shut(conn);
+    c.shut(conn);
+    with(|sc| assert_eq!(sc.closed.len(), 1));
+    assert_eq!(c.dial(90, "a").0, Outcome::Ready, "a clean close is no end");
+}
+
+#[test]
+fn a_zero_write_fails_once_and_counts_an_end_with_or_without_an_accepted_prefix() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    for prefix in [0, 2] {
+        let c = Carrier::open();
+        with(|sc| sc.ended = false);
+        let (outcome, conn) = c.dial(91, "a");
+        assert_eq!(outcome, Outcome::Ready);
+        with(|sc| {
+            sc.write_counts = if prefix == 0 {
+                [0].into()
+            } else {
+                [prefix, 0].into()
+            };
+        });
+        let (outcome, why) = c.write_frame_why(conn, b"frame");
+        assert_eq!(outcome, Outcome::Failed);
+        assert_eq!(
+            why,
+            "write: the program's pipe accepted no bytes (write zero)"
+        );
+        with(|sc| {
+            assert_eq!(sc.write_calls, if prefix == 0 { 1 } else { 2 });
+            assert_eq!(sc.written, &b"frame"[..prefix]);
+        });
+        c.assert_held_down(91, "a", "write zero faults the generation");
+        c.shut(conn);
+        c.shut(conn);
+        with(|sc| assert_eq!(sc.closed.len(), 1));
+        advance(100 * MS);
+        assert_eq!(
+            c.dial(91, "a").0,
+            Outcome::Ready,
+            "the end was counted once"
+        );
+    }
+}
+
+#[test]
+fn a_queued_flush_that_writes_a_prefix_then_zero_fails_and_counts_one_end() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    with(|sc| sc.ended = false);
+    let (outcome, conn) = c.dial(92, "a");
+    assert_eq!(outcome, Outcome::Ready);
+    with(|sc| sc.write_pends = true);
+    assert_eq!(c.write_frame(conn, b"queued"), Outcome::Ready);
+    with(|sc| {
+        sc.write_pends = false;
+        sc.write_counts = [1, 0].into();
+    });
+    assert_eq!(c.flush(conn), Outcome::Failed);
+    with(|sc| {
+        assert_eq!(sc.write_calls, 3, "one Pending, one prefix, one zero");
+        assert_eq!(sc.written, b"q");
+    });
+    c.assert_held_down(92, "a", "flush write zero faults the generation");
+    c.shut(conn);
+    c.shut(conn);
+    with(|sc| assert_eq!(sc.closed.len(), 1));
+    advance(100 * MS);
+    assert_eq!(
+        c.dial(92, "a").0,
+        Outcome::Ready,
+        "the end was counted once"
+    );
+}
+
 /// (i) Two members running one identical program trip independently.
 #[test]
 fn two_members_running_one_program_trip_independently() {
@@ -703,6 +836,44 @@ fn overlapping_handles_of_one_member_count_only_the_pipe_that_ended() {
     let (r, next) = c.dial(12, "a");
     assert_eq!(r, Outcome::Ready, "neither shut counted another end");
     c.shut(next);
+}
+
+#[test]
+fn a_delayed_overlapping_end_counts_only_inside_the_newest_crash_window() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let window = busbar_transport_stdio::supervisor::CRASH_WINDOW_NS;
+    for outside in [true, false] {
+        let c = Carrier::open();
+        with(|sc| sc.mono_ns = 0);
+        let conns: Vec<_> = (0..5)
+            .map(|_| {
+                let (outcome, conn) = c.dial(93, "a");
+                assert_eq!(outcome, Outcome::Ready);
+                conn
+            })
+            .collect();
+        let latest = 2 * window;
+        with(|sc| sc.mono_ns = latest);
+        for &conn in &conns[..4] {
+            assert_eq!(c.read(conn), Outcome::Ready);
+        }
+        // The fifth connection's clock callback delivers a snapshot sampled earlier. The
+        // script's present clock stays at `latest`; no backward clock jump is simulated.
+        with(|sc| {
+            sc.clock_snapshots
+                .push_back(if outside { 0 } else { latest - window });
+        });
+        assert_eq!(c.read(conns[4]), Outcome::Ready);
+        for conn in conns {
+            c.shut(conn);
+        }
+        advance(800 * MS);
+        if outside {
+            assert_eq!(c.dial(93, "a").0, Outcome::Ready, "only four recent ends");
+        } else {
+            c.assert_held_down(93, "a", "the inclusive boundary supplied the fifth end");
+        }
+    }
 }
 
 /// (ii) A member dropped and re-added is a new member: a new key, fresh supervision.

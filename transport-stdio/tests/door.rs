@@ -33,8 +33,8 @@ use busbar_contract::abi::transport::{
     slot, AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut,
     Destination, DialIn, EmitIn, EncodeIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut,
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, TransportTail,
-    WriteIn, DEST_AUTHORITY, DEST_PROGRAM, READ_END_OF_FRAME, ROLE_CARRIER, SETTING_COUNT,
-    UNIT0_FIRST_LINE, WRITE_END_OF_FRAME,
+    WriteIn, DEST_AUTHORITY, DEST_PROGRAM, EMIT_TRAILERS, READ_END_OF_FRAME, ROLE_CARRIER,
+    SETTING_COUNT, UNIT0_FIRST_LINE, WRITE_END_OF_FRAME,
 };
 use busbar_transport_stdio::door::{
     door, FRAME_TOO_LONG, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, STATEMENT, TOO_LONG,
@@ -1062,6 +1062,36 @@ fn every_role_stub_is_refused_with_its_own_op_text() {
     stub!(detach, DETACH, FramingIn, FramerOut, "detach");
     stub!(adopt, ADOPT, AdoptIn, FramerOut, "adopt");
     stub!(timer, TIMER, FramingIn, FramerOut, "timer");
+}
+
+#[test]
+fn a_trailer_emit_is_refused_without_writing_and_frame_writes_keep_their_own_flags() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::new(Vec::new());
+    let fields = b"x-final: yes\r\n";
+    let mut wire = [0xa5_u8; 64];
+    let mut i: EmitIn = z();
+    i.bytes = fields.as_ptr();
+    i.len = fields.len();
+    i.flags = EMIT_TRAILERS;
+    i.end_of_frame = 1;
+    i.sink.wire = wire.as_mut_ptr();
+    i.sink.wire_cap = wire.len();
+    let mut o: FramerOut = z();
+    assert_eq!(
+        call(ops().emit, h.inst, &mut i, &mut o, slot::EMIT),
+        Outcome::Refused
+    );
+    assert_eq!(
+        text(o.head.error),
+        "emit: the stdio carrier does not serve this op"
+    );
+    assert_eq!(o.yielded.wire_len, 0);
+    assert_eq!(wire, [0xa5; 64]);
+    with(|sc| assert!(sc.written.is_empty()));
+    // WRITE_END_OF_FRAME is a separate namespace from EmitIn.flags.
+    assert_eq!(h.write_frame(b"after"), Outcome::Ready);
+    with(|sc| assert_eq!(sc.written, b"after\n"));
 }
 
 #[test]
