@@ -768,8 +768,6 @@ fn a_raised_request_body_bound_carries_a_line_past_the_default() {
     );
 }
 
-/// A config apply moves the ceiling: the refresh's bound holds from the next op on. RED (row 159,
-
 #[test]
 fn a_refresh_moves_the_line_ceiling() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
