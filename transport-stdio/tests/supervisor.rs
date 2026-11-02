@@ -39,7 +39,7 @@ use busbar_contract::abi::transport::{
     slot, ConnIn, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, WriteIn, DEST_PROGRAM,
     WRITE_END_OF_FRAME,
 };
-use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, TOO_LONG};
+use busbar_transport_stdio::door::{door, MAX_LINE_BYTES, NO_CLOCK, TOO_LONG};
 
 const MS: u64 = 1_000_000;
 
@@ -665,7 +665,7 @@ fn a_member_is_not_run_when_the_clock_does_not_answer() {
     let (r, _, why) = c.dial_why(60, "a");
     assert_eq!(r, Outcome::Failed);
     assert_eq!(with(|sc| sc.spawns), before, "no program was spawned");
-    assert!(why.contains("did not answer"), "reason was: {why}");
+    assert_eq!(why, NO_CLOCK);
     assert_eq!(c.dial(0, "a").0, Outcome::Ready);
 }
 
