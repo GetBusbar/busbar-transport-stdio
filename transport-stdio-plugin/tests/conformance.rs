@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::task::{Wake, Waker};
 use std::time::{Duration, Instant};
 
-use busbar_contract::abi::mechanism::call::{AbiStr, Field, OutHead, Outcome};
+use busbar_contract::abi::mechanism::call::{AbiStr, Field, InHead, OutHead, Outcome};
 use busbar_contract::abi::transport::{
     slot, AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut,
     Destination, DialIn, EmitIn, EncodeIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut,
@@ -17,9 +17,7 @@ use busbar_contract::abi::transport::{
 };
 
 use busbar_contract::abi::mechanism::call::{Blob, BLOB_JSON};
-use busbar_contract::abi::mechanism::lifecycle::{
-    slot as life, InHead, OpenIn, OpenOut, ValidateIn,
-};
+use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut, ValidateIn};
 use busbar_core_connector::hostio::{Admission, HostIo};
 use busbar_core_connector::spawn_env::HeldEnv;
 use busbar_plugin_loader::dispatch::InlineTicket;
