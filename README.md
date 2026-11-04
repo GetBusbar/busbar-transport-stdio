@@ -32,7 +32,8 @@ start backoffs of 100, 200, 400 and 800 ms. Five ends inside 60 seconds hold the
 it is declared anew. A sibling member has its own state, and rotating a secret under an unchanged
 member does not reset the trip. A supervised dial requires the host's monotonic clock and fails
 without spawning when that clock is unavailable. A clean close of a running program does not
-count as an end; a key of zero names an unsupervised program.
+count as an end; a key of zero names an unsupervised program. Ends observed during a clock
+outage remain recorded after close; their backoffs begin when the clock answers again.
 
 ## Build
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The **`stdio` transport as a droppable busbar plugin**: the `cdylib` a signed tarball of the wire
+//! The **`stdio` transport as a droppable busbar plugin**: the `cdylib` a signed tarball of the
+//! wire carries (`kind: transport`, key `stdio`), exporting `busbar_plugin_door`.
 
 #![deny(unsafe_code)]
 

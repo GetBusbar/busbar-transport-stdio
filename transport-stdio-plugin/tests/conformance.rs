@@ -1076,6 +1076,17 @@ fn program_exit(host: &HostIo) -> String {
     }
 }
 
+fn same_answers_and_crossings(
+    left: &[(String, String, u64, u64)],
+    right: &[(String, String, u64, u64)],
+) -> bool {
+    left.iter()
+        .map(|(name, answer, crossings, _)| (name, answer, crossings))
+        .eq(right
+            .iter()
+            .map(|(name, answer, crossings, _)| (name, answer, crossings)))
+}
+
 #[test]
 fn the_linked_and_the_dropped_in_door_are_one_plugin() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1097,15 +1108,8 @@ fn the_linked_and_the_dropped_in_door_are_one_plugin() {
     if std::env::var("BUSBAR_CONFORMANCE_RED").as_deref() == Ok("count") {
         dropped[0].2 += 1;
     }
-    assert_eq!(
-        linked
-            .iter()
-            .map(|(n, a, c, _)| (n, a, c))
-            .collect::<Vec<_>>(),
-        dropped
-            .iter()
-            .map(|(n, a, c, _)| (n, a, c))
-            .collect::<Vec<_>>(),
+    assert!(
+        same_answers_and_crossings(&linked, &dropped),
         "crossing(s), pinned: linked and dropped answers/counts must agree"
     );
 }
@@ -1181,8 +1185,8 @@ fn red_a_moved_crossing_count_is_refused() {
     for index in 0..honest.len() {
         let mut changed = honest.clone();
         changed[index].2 += 1;
-        assert_ne!(
-            honest, changed,
+        assert!(
+            !same_answers_and_crossings(&honest, &changed),
             "changed count at {} was accepted",
             honest[index].0
         );
@@ -1191,7 +1195,7 @@ fn red_a_moved_crossing_count_is_refused() {
     for step in &mut doubled {
         step.2 *= 2;
     }
-    assert_ne!(honest, doubled);
+    assert!(!same_answers_and_crossings(&honest, &doubled));
 }
 
 #[test]

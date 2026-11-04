@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The stdio supervisor: the restart policy of a program that keeps ending. A circuit breaker, not a
+//! The stdio supervisor: the restart policy of a program that keeps ending.
 
 /// Nanoseconds in a millisecond.
 const MS: u64 = 1_000_000;
@@ -24,11 +24,16 @@ pub struct Supervisor {
     restart_at: Option<u64>,
     /// [`CRASH_THRESHOLD`] ends inside the window: no restart until the member is declared anew.
     tripped: bool,
+    /// Ends awaiting a working clock, bounded by the trip threshold.
+    pending_ends: usize,
 }
 
 impl Supervisor {
     /// The program ended (or could not be spawned) at `now`.
     pub fn crashed(&mut self, now: u64) {
+        if self.tripped {
+            return;
+        }
         let latest = self.latest_crash.map_or(now, |at| at.max(now));
         self.latest_crash = Some(latest);
         self.crashes
@@ -49,7 +54,23 @@ impl Supervisor {
         self.restart_at = Some(self.restart_at.map_or(restart_at, |at| at.max(restart_at)));
     }
 
+    /// Retain an end until the clock answers, even after its connection is removed.
+    pub(crate) fn defer_end(&mut self) {
+        if !self.tripped {
+            self.pending_ends = (self.pending_ends + 1).min(CRASH_THRESHOLD);
+        }
+    }
+
+    /// Start deferred ends' backoffs when the host clock next answers.
+    pub(crate) fn resolve_deferred(&mut self, now: u64) {
+        let pending = std::mem::take(&mut self.pending_ends);
+        for _ in 0..pending {
+            self.crashed(now);
+        }
+    }
+
     /// Whether it holds nothing at `now`: no end inside the window, no backoff pending, not
+    /// tripped.
     pub fn idle(&self, now: u64) -> bool {
         self.may_restart(now)
             && self
@@ -60,7 +81,7 @@ impl Supervisor {
 
     /// Whether the program may be spawned at `now`.
     pub fn may_restart(&self, now: u64) -> bool {
-        !self.tripped && self.restart_at.is_none_or(|at| now >= at)
+        !self.tripped && self.pending_ends == 0 && self.restart_at.is_none_or(|at| now >= at)
     }
 }
 

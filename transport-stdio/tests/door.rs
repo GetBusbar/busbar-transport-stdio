@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The `stdio` carrier, driven through its own table the way the host's connector drives it, over a
+//! The `stdio` carrier, driven through its own table the way the host's connector drives it, over
+//! a SCRIPTED host I/O table (`abi::host::io`): one frame per line in (a line split across reads,
+//! a blank line, the final unterminated line, the line ceiling), one line per frame out (gathered
+//! to its end, refused when it cannot be one line), the spawn of exactly the program it is lent,
+//! and every op of a role it does not play refused.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -317,6 +321,23 @@ struct Host {
     conn: u64,
 }
 
+impl Drop for Host {
+    fn drop(&mut self) {
+        let mut input: InHead = z();
+        let mut output: OutHead = z();
+        assert_eq!(
+            call(
+                ops().head.close,
+                self.inst,
+                &mut input,
+                &mut output,
+                life::CLOSE
+            ),
+            Outcome::Ready
+        );
+    }
+}
+
 impl Host {
     fn new(reads: Vec<Option<Vec<u8>>>) -> Self {
         Self::with_settings(None, reads)
@@ -388,6 +409,7 @@ impl Host {
     }
 
     /// A read into the caller's buffer: the outcome, the bytes answered and the frame bit, and no
+    /// allocation of its own.
     fn read_into(&self, buf: &mut [u8]) -> (Outcome, usize, bool) {
         let mut i: ReadIn = z();
         i.conn = self.conn;
@@ -440,6 +462,8 @@ fn the_tail_is_a_carrier_composing_over_nothing() {
 }
 
 /// The claim row states the facts the root reads for a stdio session: a session, bound to its
+/// principal, whose first unit opens on its first line, and no selector forms; and the linked
+/// entry's `SESSION` says the same.
 #[test]
 fn the_claim_row_states_a_line_session_and_the_linked_entry_agrees() {
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
@@ -664,6 +688,7 @@ fn a_frame_goes_out_as_one_line_and_one_that_cannot_be_one_is_refused() {
 }
 
 /// A frame refused while it was gathered (it holds a newline, or it ran past the ceiling) leaves
+/// nothing gathered: the next good frame goes out as its own line, no refused byte before it.
 #[test]
 fn a_refused_frame_leaves_nothing_gathered_for_the_next() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -746,6 +771,9 @@ fn a_buffered_line_and_a_whole_frame_allocate_nothing() {
 }
 
 /// A LINE OF 100 KiB IS ONE FRAME: the carrier's line bound is the host's own bound on one
+/// inbound frame of a byte channel (the request-body bound), not a 64 KiB cursor budget, so a
+/// stdio program's large message (a long tool list, a resource read carrying base64) is read
+/// whole.
 #[test]
 fn a_line_of_a_hundred_kib_is_one_frame() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -764,6 +792,8 @@ fn a_line_of_a_hundred_kib_is_one_frame() {
 }
 
 /// A FRAME IS BOUNDED LIKE A LINE: the bytes gathered for one outbound frame stop at the line
+/// ceiling ([`MAX_LINE_BYTES`]), as an inbound line does; past it the write FAILS, not gathered
+/// without bound.
 #[test]
 fn a_gathered_frame_past_the_line_ceiling_fails() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -780,6 +810,8 @@ fn a_gathered_frame_past_the_line_ceiling_fails() {
 }
 
 /// THE LINE CEILING IS THE OPERATOR'S REQUEST-BODY BOUND: the tail declares the one setting the
+/// carrier reads, at its 1.5.5 path (`limits.request_body_max_bytes`), a count whose declared
+/// default is the default ceiling.
 #[test]
 fn the_tail_declares_the_request_body_bound_it_reads() {
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
@@ -794,6 +826,7 @@ fn the_tail_declares_the_request_body_bound_it_reads() {
 }
 
 /// A deployment's request-body bound is the line ceiling both ways: a line or a frame of exactly
+/// the bound crosses, one byte more fails the read or the write.
 #[test]
 fn the_line_ceiling_is_the_deployments_request_body_bound() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -883,7 +916,8 @@ fn a_refresh_moves_the_read_ceiling() {
     assert_eq!((r, why.as_str()), (Outcome::Failed, TOO_LONG));
 }
 
-/// A bound that is no count of bytes is FAILED at `validate`, before any instance opens on it:
+/// A bound that is no count of bytes is FAILED at `validate`, before any instance opens on it: a
+/// string, a negative number, a fraction and a null alike.
 #[test]
 fn a_request_body_bound_that_is_no_count_fails_validation() {
     for bound in ["\"big\"", "-1", "1.5", "null"] {
@@ -907,6 +941,7 @@ fn a_request_body_bound_that_is_no_count_fails_validation() {
 }
 
 /// An op on a connection that is gone FAILS: after the shut, a read and a write find no such
+/// connection (not a clean end, not a taken frame).
 #[test]
 fn a_read_or_write_on_a_shut_connection_fails() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -951,6 +986,7 @@ fn arrival_answers_for_a_live_connection_only() {
 }
 
 /// A line of exactly the ceiling ended by CRLF is one frame whichever read its CR and its LF
+/// arrive in: a CR still waiting for its LF is the terminator's, not the line's.
 #[test]
 fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -969,7 +1005,10 @@ fn a_crlf_line_at_the_ceiling_is_one_frame_however_its_reads_split() {
     );
 }
 
-/// A SLOW READER'S QUEUE IS BOUNDED: a program that reads stdin slower than frames arrive leaves the
+/// A SLOW READER'S QUEUE IS BOUNDED: a program that reads stdin slower than frames arrive leaves
+/// the pipe never fully drained when the next frame is written, yet the bytes the pipe took leave
+/// the queue, so it holds a working size (not every byte ever written) and the data path
+/// allocates nothing once the queue sits at its cap.
 #[test]
 fn a_program_that_reads_slower_than_frames_arrive_holds_a_bounded_queue() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1196,12 +1235,7 @@ fn instance_close_closes_every_held_connection() {
         Outcome::Ready
     );
     with(|sc| assert!(sc.closed.is_empty()));
-    let mut i: InHead = z();
-    let mut o: OutHead = z();
-    assert_eq!(
-        call(ops().head.close, h.inst, &mut i, &mut o, life::CLOSE),
-        Outcome::Ready
-    );
+    drop(h);
     with(|sc| {
         let mut closed = sc.closed.clone();
         closed.sort_unstable();
@@ -1242,6 +1276,7 @@ fn the_statement_carries_the_declares_document() {
 }
 
 /// `arrival` with no open instance says so, in the op's own words (the same as tcp's), and an
+/// unknown connection on an open instance keeps `no such connection`.
 #[test]
 fn arrival_with_no_instance_says_no_open_instance() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1290,4 +1325,23 @@ fn the_carrier_states_no_op_facts() {
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
     let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
     assert_eq!(tail.facts, 0);
+}
+
+#[test]
+fn a_refresh_rechecks_an_inbound_line_already_partly_returned() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::with_settings(
+        Some(&body_max(128)),
+        vec![Some(vec![b'x'; 100]), Some(vec![b'\n'])],
+    );
+    assert_eq!(
+        h.read(1),
+        (Outcome::Ready, vec![b'x'], false, String::new())
+    );
+    assert_eq!(h.refresh(&body_max(64)), Outcome::Ready);
+    let (outcome, bytes, end, why) = h.read(128);
+    assert_eq!(outcome, Outcome::Failed);
+    assert!(bytes.is_empty());
+    assert!(!end);
+    assert_eq!(why, TOO_LONG);
 }

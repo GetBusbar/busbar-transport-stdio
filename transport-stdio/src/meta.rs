@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! What this transport declares about itself: the key it answers on, the one setting it reads and
+//! the transport kind's tail its door states.
 
 use busbar_contract::abi::sdk::transport::{setting_decls, SettingRow, DEFAULT_BODY_MAX};
 use busbar_contract::abi::transport::{
@@ -17,6 +18,7 @@ pub const KEY: &str = "stdio";
 pub(crate) const SESSION: bool = true;
 
 /// The one setting this transport reads: the deployment's request-body bound, its line ceiling (a
+/// transport's knobs reach it as the settings its door declares).
 pub(crate) const SETTING_ROWS: [SettingRow; 1] = [SettingRow {
     path: BODY_MAX_BYTES,
     kind: SETTING_COUNT,

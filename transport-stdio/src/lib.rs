@@ -13,6 +13,7 @@ pub mod supervisor;
 mod transport;
 
 /// The transport axis entry the composition root folds for this transport: its key, the layers it
+/// declares and its door.
 pub mod linked {
     /// The row's registry key.
     pub const KEY: &str = crate::door::KEY;

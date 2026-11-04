@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `stdio` DOOR: this transport as a CARRIER on the transport kind's table
+//! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door, refusing
+//! listen, accept, and framer operations.
 
 use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::sdk::door::statement;
