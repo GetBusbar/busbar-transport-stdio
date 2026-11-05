@@ -30,11 +30,15 @@ busbar_contract::statement_extensions!(
     )]
 );
 
+/// The published lifecycle settings schema.
+const SETTINGS_SCHEMA: &[u8] = include_bytes!("../settings.schema.json");
+
 /// The door's Statement: the `stdio` carrier.
 pub const STATEMENT: Statement = {
     let mut s = statement(KEY, env!("CARGO_PKG_VERSION"), 64)
         .with_kind_tail(&TAIL)
         .with_claims(CLAIM_NAMES);
+    s.settings_schema = busbar_contract::abi::mechanism::call::Blob::json(SETTINGS_SCHEMA);
     s.extensions = EXTENSIONS;
     s
 };
@@ -64,3 +68,7 @@ busbar_contract::plugin_door! {
         timer: Safe<Timer>,
     },
 }
+
+#[cfg(test)]
+#[path = "tests/settings_schema_tests.rs"]
+mod settings_schema_tests;
