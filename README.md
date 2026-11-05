@@ -33,7 +33,9 @@ it is declared anew. A sibling member has its own state, and rotating a secret u
 member does not reset the trip. A supervised dial requires the host's monotonic clock and fails
 without spawning when that clock is unavailable. A clean close of a running program does not
 count as an end; a key of zero names an unsupervised program. Ends observed during a clock
-outage remain recorded after close; their backoffs begin when the clock answers again.
+outage remain recorded after close; their backoffs begin when the clock answers again. A missing
+or failed host process-exit observation makes shutdown report that failure after closing the
+program; it does not fall back to guessing the process state from its pipes.
 
 ## Build
 

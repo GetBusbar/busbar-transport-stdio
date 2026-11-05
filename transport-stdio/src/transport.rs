@@ -93,21 +93,21 @@ const PIPE_MAX_BYTES: usize = 1024 * 1024;
 /// read that finds its end.
 const SHUT_PROBE_READS: usize = PIPE_MAX_BYTES / READ_CHUNK + 1;
 
-/// Check the parent process independently of inherited pipes, then use the pipe probe as a
-/// fallback for older hosts without process-exit reporting.
-fn found_ended(io: &mut Io<'_>, handle: u64) -> bool {
-    if matches!(io.program_exit(handle), Ok(Some(_))) {
-        return true;
+/// Check the parent process independently of inherited pipes. A running parent's output may
+/// already have ended or failed, so check its pipe too. Exit-reporting failures stay failures.
+fn found_ended(io: &mut Io<'_>, handle: u64) -> Result<bool, IoFailure> {
+    if io.program_exit(handle)?.is_some() {
+        return Ok(true);
     }
     let mut chunk = [0_u8; READ_CHUNK];
     for _ in 0..SHUT_PROBE_READS {
         match io.read(handle, &mut chunk) {
-            Poll::Pending => return false,
-            Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => return true,
+            Poll::Pending => return Ok(false),
+            Poll::Ready(Ok(0)) | Poll::Ready(Err(_)) => return Ok(true),
             Poll::Ready(Ok(_)) => {}
         }
     }
-    false
+    Ok(false)
 }
 
 /// Why a read fails.
@@ -676,8 +676,16 @@ impl SafeSlot for Shut {
             let mut conn = lock(&held);
 
             let open = !conn.ended && !conn.faulted;
-            if conn.key != 0 && !conn.counted && open && found_ended(&mut io, conn.io) {
-                conn.ended = true;
+            if conn.key != 0 && !conn.counted && open {
+                match found_ended(&mut io, conn.io) {
+                    Ok(ended) => conn.ended = ended,
+                    Err(e) => {
+                        // An unavailable exit observation is not a running program. Still close
+                        // its handle before reporting the host failure.
+                        let _ = io.close(conn.io);
+                        return o.fail(refusal(&e));
+                    }
+                }
             }
             if conn.ended || conn.faulted {
                 c.ended(&mut conn, now(&inst));

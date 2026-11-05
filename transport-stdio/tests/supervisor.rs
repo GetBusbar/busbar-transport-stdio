@@ -100,6 +100,10 @@ struct Script {
     spawn_elapsed_ns: u64,
     /// Whether a read FAILS (the pipe errors) rather than answering.
     read_fails: bool,
+    /// Reads attempted, including a shutdown pipe probe.
+    read_calls: usize,
+    /// A failed or refused process-exit observation.
+    exit_failure: Option<Outcome>,
     /// Whether a read finds the program ended (`true`) or running (`false`: PENDING).
     ended: bool,
     /// Independently ended pipes while the script's other handles are still running.
@@ -133,6 +137,8 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     spawn_refused: false,
     spawn_elapsed_ns: 0,
     read_fails: false,
+    read_calls: 0,
+    exit_failure: None,
     ended: true,
     ended_handles: Vec::new(),
     parent_exited: false,
@@ -182,6 +188,7 @@ extern "C" fn io_spawn(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> Ra
 extern "C" fn io_read(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
     let i = unsafe { input.cast::<IoReadIn>().read() };
+    with(|sc| sc.read_calls += 1);
     if with(|sc| sc.read_fails) {
         return answer(out, Outcome::Failed, 0, 0);
     }
@@ -234,6 +241,11 @@ extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
 }
 
 extern "C" fn io_ends(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    if let Some(outcome) = with(|sc| sc.exit_failure) {
+        // SAFETY: the caller lends its ServiceOut; the error text is static.
+        unsafe { (*out).error = s("program exit status unavailable") };
+        return answer(out, outcome, 0, 0);
+    }
     // SAFETY: the caller lends its ServiceOut for this service crossing.
     unsafe { (*out).exited = u8::from(with(|sc| sc.parent_exited)) };
     answer(out, Outcome::Ready, 0, 0)
@@ -315,6 +327,8 @@ impl Carrier {
             spawn_refused: false,
             spawn_elapsed_ns: 0,
             read_fails: false,
+            read_calls: 0,
+            exit_failure: None,
             ended: true,
             ended_handles: Vec::new(),
             parent_exited: false,
@@ -464,13 +478,22 @@ impl Carrier {
     }
 
     fn shut(&self, conn: u64) {
+        assert_eq!(self.shut_why(conn).0, Outcome::Ready);
+    }
+
+    fn shut_why(&self, conn: u64) -> (Outcome, String) {
         let mut i: ShutIn = z();
         i.conn = conn;
         let mut o: OutHead = z();
-        assert_eq!(
-            call(ops().shut, self.inst, &mut i, &mut o, slot::SHUT),
-            Outcome::Ready
-        );
+        let outcome = call(ops().shut, self.inst, &mut i, &mut o, slot::SHUT);
+        let why = if o.error.len == 0 {
+            String::new()
+        } else {
+            // SAFETY: the carrier's error bytes remain live until release or instance close.
+            let bytes = unsafe { std::slice::from_raw_parts(o.error.ptr, o.error.len) };
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        (outcome, why)
     }
 
     /// Run the member `key`'s program once to its end: dialed, read to its end, shut.
@@ -607,14 +630,56 @@ fn a_pipe_error_first_seen_at_shut_counts_as_an_end() {
 }
 
 #[test]
-fn a_clean_shut_on_a_host_without_exit_reporting_is_not_an_end() {
+fn a_missing_exit_service_fails_shut_without_a_pipe_fallback_and_closes_once() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::with_exit_reporting(false);
-    with(|sc| sc.ended = false);
-    for _ in 0..10 {
-        let (r, conn) = c.dial(83, "a");
+    let (r, conn) = c.dial(83, "a");
+    assert_eq!(r, Outcome::Ready);
+    assert_eq!(
+        c.shut_why(conn),
+        (
+            Outcome::Failed,
+            "the instance was handed no host I/O".into()
+        )
+    );
+    with(|sc| {
+        assert_eq!(
+            sc.read_calls, 0,
+            "no pipe fallback for a missing exit service"
+        );
+        assert_eq!(sc.closed, [2], "the process is closed despite the failure");
+    });
+    c.shut(conn);
+    drop(c);
+    with(|sc| assert_eq!(sc.closed, [2], "cleanup never closes the handle twice"));
+}
+
+#[test]
+fn a_failed_exit_observation_preserves_its_outcome_and_closes_without_probing() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    for failure in [Outcome::Failed, Outcome::Refused] {
+        let c = Carrier::open();
+        let (r, conn) = c.dial(84, "a");
         assert_eq!(r, Outcome::Ready);
+        with(|sc| sc.exit_failure = Some(failure));
+        assert_eq!(
+            c.shut_why(conn),
+            (failure, "program exit status unavailable".into())
+        );
+        with(|sc| {
+            assert_eq!(
+                sc.read_calls, 0,
+                "an exit-service failure is not a pipe EOF"
+            );
+            assert_eq!(
+                sc.closed,
+                [2],
+                "the failed observation cannot leak the process"
+            );
+        });
         c.shut(conn);
+        drop(c);
+        with(|sc| assert_eq!(sc.closed, [2]));
     }
 }
 
