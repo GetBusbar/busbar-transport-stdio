@@ -131,3 +131,25 @@ fn outbound_compaction_keeps_normal_queue_growth_capacity() {
     assert_eq!(c.outbound.capacity(), capacity);
     assert_eq!(c.outbound.len(), MAX_QUEUED_BYTES / 2);
 }
+
+#[test]
+fn outbound_append_reuses_a_sent_prefix_before_the_halfway_threshold() {
+    let mut outbound = Vec::with_capacity(512_512);
+    outbound.resize(512_000, b'x');
+    let capacity = outbound.capacity();
+    let mut c = Conn {
+        outbound,
+        sent: 255_000,
+        ..Conn::default()
+    };
+    c.compact_outbound();
+    assert_eq!(c.sent, 255_000, "the queue is not yet half consumed");
+    c.make_outbound_room(1001);
+    c.outbound.extend_from_slice(&[b'y'; 1000]);
+    c.outbound.push(b'\n');
+    assert_eq!(c.outbound.capacity(), capacity);
+    assert_eq!(c.sent, 0);
+    assert_eq!(&c.outbound[..257_000], vec![b'x'; 257_000]);
+    assert_eq!(&c.outbound[257_000..258_000], &[b'y'; 1000]);
+    assert_eq!(c.outbound.last(), Some(&b'\n'));
+}

@@ -401,6 +401,15 @@ impl Conn {
         }
     }
 
+    /// Reuse the sent prefix before an append would grow the allocation. A slowly drained
+    /// queue can fill its capacity just before the half-consumed compaction threshold.
+    fn make_outbound_room(&mut self, additional: usize) {
+        if self.sent > 0 && additional > self.outbound.capacity() - self.outbound.len() {
+            self.outbound.drain(..self.sent);
+            self.sent = 0;
+        }
+    }
+
     /// Write what is queued, as far as the pipe takes it now: `Pending` while some is left.
     fn drain(&mut self, io: &mut Io<'_>) -> Poll<Result<(), IoFailure>> {
         while self.sent < self.outbound.len() {
@@ -613,6 +622,7 @@ impl SafeSlot for Write {
                 c.message.extend_from_slice(bytes);
             } else {
                 let c = &mut *c;
+                c.make_outbound_room(c.message.len() + bytes.len() + 1);
                 // A frame that arrives whole in one write is checked where it lies and queued
                 // straight to `outbound`, copied once; a gathered one is its gathered bytes.
                 let frame: &[u8] = if c.message.is_empty() {
