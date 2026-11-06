@@ -3,7 +3,7 @@
   "transport": {
     "carrier": {
       "listen": false,
-      "dial": { "program": "/bin/cat", "args": [], "env": [] },
+      "dial": { "program": "@conformance-program", "args": ["echo"], "env": [] },
       "exchange": [
         { "write": "{\"jsonrpc\":\"2.0\",\"id\":1}", "read": "{\"jsonrpc\":\"2.0\",\"id\":1}" },
         { "write": "", "read": "" },

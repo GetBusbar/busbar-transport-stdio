@@ -31,3 +31,10 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 busbar-core-connector = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
+
+# Native subprocess used by conformance; excluded from the shipped cdylib.
+[[bin]]
+name = "conformance-program"
+path = "tests/support/program.rs"
+test = false
+bench = false
