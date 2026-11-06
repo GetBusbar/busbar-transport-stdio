@@ -22,7 +22,8 @@ fn main() {
         }
         Some("exit-open") => {
             // Exit independently of stdout EOF: the descendant inherits the pipe.
-            // It expires just as the original shell fixture's background sleep did.
+            // It outlives the test's 4 s exit poll by a wide margin, so a slow runner still finds
+            // the pipe open after the parent's exit, then expires on its own.
             let _descendant = Command::new(std::env::current_exe().unwrap())
                 .arg("hold-open")
                 .stdin(Stdio::null())
@@ -32,7 +33,7 @@ fn main() {
                 .unwrap();
             std::process::exit(3);
         }
-        Some("hold-open") => std::thread::sleep(Duration::from_secs(5)),
+        Some("hold-open") => std::thread::sleep(Duration::from_secs(30)),
         _ => panic!("expected echo, exit-open, or hold-open"),
     }
 }

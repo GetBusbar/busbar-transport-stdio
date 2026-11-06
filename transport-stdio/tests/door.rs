@@ -462,10 +462,9 @@ fn the_tail_is_a_carrier_composing_over_nothing() {
 }
 
 /// The claim row states the facts the root reads for a stdio session: a session, bound to its
-/// principal, whose first unit opens on its first line, and no selector forms; and the linked
-/// entry's `SESSION` says the same.
+/// principal, whose first unit opens on its first line, and no selector forms.
 #[test]
-fn the_claim_row_states_a_line_session_and_the_linked_entry_agrees() {
+fn the_claim_row_states_a_line_session() {
     // SAFETY: the Statement's kind tail is this crate's `'static` `TransportTail`.
     let tail = unsafe { &*STATEMENT.kind_tail.cast::<TransportTail>() };
     assert_eq!(tail.claim_rows_len, 1, "one claim row: stdio");
@@ -482,11 +481,6 @@ fn the_claim_row_states_a_line_session_and_the_linked_entry_agrees() {
         text(claim.egress_selector_forms),
         "",
         "no outbound selector forms"
-    );
-    assert_eq!(
-        busbar_transport_stdio::linked::SESSION,
-        claim.session == 1,
-        "linked::SESSION agrees with the claim row"
     );
 }
 
@@ -706,6 +700,22 @@ fn a_refused_frame_leaves_nothing_gathered_for_the_next() {
     );
     assert_eq!(h.write(b"second", true).0, Outcome::Ready);
     with(|sc| assert_eq!(sc.written, b"first\nsecond\n"));
+}
+
+/// A gathered frame is judged whole: a carriage return that ends an earlier piece still ends the
+/// frame when its last piece is empty, so the frame is refused and writes nothing.
+#[test]
+fn a_gathered_frame_ending_in_a_return_is_refused() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::new(Vec::new());
+    assert_eq!(h.write(b"a return\r", false).0, Outcome::Ready);
+    assert_eq!(
+        h.write(b"", true),
+        (Outcome::Failed, NOT_ONE_LINE.to_owned())
+    );
+    with(|sc| assert!(sc.written.is_empty(), "a refused frame writes nothing"));
+    assert_eq!(h.write(b"next", true).0, Outcome::Ready);
+    with(|sc| assert_eq!(sc.written, b"next\n"));
 }
 
 #[test]

@@ -16,7 +16,7 @@ use busbar_plugin_loader::dispatch::{
 };
 use std::sync::{
     atomic::{AtomicPtr, AtomicU64, Ordering},
-    Mutex,
+    Mutex, PoisonError,
 };
 static SERIAL: Mutex<()> = Mutex::new(());
 static CHANGED: AtomicPtr<Door> = AtomicPtr::new(std::ptr::null_mut());
@@ -47,7 +47,7 @@ fn assert_rebuild(error: &LoadError) {
     );
 }
 pub(super) fn red_a_door_at_another_kind_abi_is_refused() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let real = actual();
     let host = KindCode::Transport.abi_version();
     assert_eq!(real.kind_abi, host);
@@ -79,7 +79,7 @@ pub(super) fn red_a_door_at_another_kind_abi_is_refused() {
     }
 }
 pub(super) fn red_a_door_built_against_another_kind_layout_is_refused() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let real = actual();
     let kind = KindCode::Transport;
     let host = kind.layout_fingerprint();
@@ -120,7 +120,7 @@ pub(super) fn red_a_door_built_against_another_kind_layout_is_refused() {
     }
 }
 pub(super) fn red_a_transport_built_against_another_frame_piece_is_refused() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let real = actual();
     let d = Dispatcher::new(Default::default());
     // SAFETY: the loaded real transport provides a complete static Statement and TransportTail.
@@ -159,7 +159,7 @@ pub(super) fn red_a_transport_built_against_another_frame_piece_is_refused() {
     );
 }
 pub(super) fn red_a_statement_other_than_the_stated_one_is_refused() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let real = actual();
     let d = Dispatcher::new(Default::default());
     // SAFETY: the genuine door's complete immutable static statement was validated above.
@@ -212,7 +212,7 @@ extern "C" fn fail_ready(
     raw
 }
 pub(super) fn red_a_failing_ready_refuses_the_boot() {
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     READY_CALLS.store(0, Ordering::SeqCst);
     change(DoorParts {
         ready: Some(fail_ready),
@@ -275,7 +275,7 @@ pub(super) fn the_declared_needs_are_the_statements() {
 
 pub(super) fn red_a_networked_door_with_no_connection_table_is_refused() {
     use busbar_contract::abi::host::conn::connector::{Need, DIRECTION_OUTBOUND, KEEP_NAMED};
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let real = actual();
     // SAFETY: the real product statement is immutable ABI data; mutate only its needs metadata.
     let statement = unsafe { real.statement.read_unaligned() };

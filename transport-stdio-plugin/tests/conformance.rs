@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 //! Real stdio carrier, admitted by the loader through both independently built doors.
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Wake, Waker};
@@ -10,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use busbar_contract::abi::mechanism::call::{AbiStr, Field, InHead, OutHead, Outcome};
 use busbar_contract::abi::transport::{
-    slot, AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut,
-    Destination, DialIn, EmitIn, EncodeIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut,
-    ListenIn, ListenOut, LocateIn, LocateOut, ReadIn, RefuseIn, ShutIn, WriteIn, CLOSE_NORMAL,
-    DEST_AUTHORITY, DEST_PROGRAM, MAX_ADDR, READ_END_OF_FRAME, WRITE_END_OF_FRAME,
+    slot, AdoptIn, BeginIn, ConnIn, ConnOut, Destination, DialIn, EmitIn, EncodeIn, FinishIn,
+    FramerOut, FramingIn, IngestIn, IoOut, ListenIn, ListenOut, LocateIn, LocateOut, ReadIn,
+    RefuseIn, ShutIn, WriteIn, CLOSE_NORMAL, DEST_AUTHORITY, DEST_PROGRAM, MAX_ADDR,
+    READ_END_OF_FRAME, WRITE_END_OF_FRAME,
 };
 
 use busbar_contract::abi::mechanism::call::{Blob, BLOB_JSON};
@@ -313,25 +311,6 @@ fn woken(_host: &HostIo, side: &Side) -> bool {
     false
 }
 
-fn echo() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").expect("the echo far end binds");
-    let at = l.local_addr().expect("bound").to_string();
-    std::thread::spawn(move || {
-        for s in l.incoming() {
-            let Ok(mut s) = s else { return };
-            std::thread::spawn(move || {
-                let mut buf = [0_u8; 4096];
-                while let Ok(n) = s.read(&mut buf) {
-                    if n == 0 || s.write_all(&buf[..n]).is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-    });
-    at
-}
-
 enum Want {
     Is(String),
     Starts(&'static str),
@@ -441,19 +420,20 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
         results.push((("framer ops").to_string(), answer, crossed, resumed));
     };
 
-    let listens = k["listen"].as_bool().unwrap_or(false);
+    // A stdio carrier listens on nothing: its fixture states `listen: false`.
+    assert_eq!(
+        k["listen"].as_bool(),
+        Some(false),
+        "a stdio carrier never listens"
+    );
     let ls = Side::new(&d);
     let bind_at = "127.0.0.1:0";
     host.admit(ls.ticket.ticket(), Admission::Bind(bind_at.into()));
     let mut addr = vec![0_u8; MAX_ADDR as usize];
-    let want = if listens {
-        is("Ready addr=127.0.0.1:*")
-    } else {
-        Want::Starts("Refused")
-    };
-    let (listener, bound) = {
+    let want = Want::Starts("Refused");
+    {
         let before = counts(&p);
-        let (answer, value) = {
+        let answer = {
             let mut i: ListenIn = input();
             i.bind = abi(bind_at);
             i.addr_buf = addr.as_mut_ptr();
@@ -464,7 +444,7 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
                 Outcome::Ready => format!("Ready addr={}", unported(&bound)),
                 other => format!("{other:?}"),
             };
-            (line, (o.listener, bound))
+            line
         };
         let after = counts(&p);
         let crossed = after.0 - before.0;
@@ -475,205 +455,17 @@ fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
             Want::Starts(prefix) => assert!(answer.starts_with(prefix), "{}: {}", "listen", answer),
         };
         results.push((("listen").to_string(), answer, crossed, resumed));
-        value
     };
-    let host_listener = listens.then(|| host.made(ls.ticket.ticket())).flatten();
-    assert_eq!(
-        host_listener.is_some(),
-        listens,
-        "only a listening carrier minted a listener"
+    assert!(
+        host.made(ls.ticket.ticket()).is_none(),
+        "a refused listen minted no listener"
     );
-    if listens {
-        let mut far = TcpStream::connect(&bound).expect("the script reaches the listener");
-        let _ = far.set_read_timeout(Some(Duration::from_secs(5)));
-
-        let mut peer = vec![0_u8; MAX_ADDR as usize];
-        let accepted = {
-            let before = counts(&p);
-            let (answer, value) = {
-                let mut i: AcceptIn = input();
-                i.listener = listener;
-                i.peer_buf = peer.as_mut_ptr();
-                i.peer_cap = peer.len();
-                let mut frame = Frame::new(i, output::<AcceptOut>());
-                let mut c = p.call_inline(ls.ticket.ticket(), false, slot::ACCEPT, &mut frame);
-                let until = Instant::now() + Duration::from_secs(5);
-                while c.outcome == Outcome::Pending && Instant::now() < until {
-                    std::thread::sleep(Duration::from_millis(2));
-                    if ls.woken.0.swap(false, Ordering::SeqCst) {
-                        c = p.call_inline(ls.ticket.ticket(), true, slot::ACCEPT, &mut frame);
-                    }
-                }
-                let o = frame.out;
-                let at = lossy(&peer[..(o.peer_written as usize).min(peer.len())]);
-                (format!("{:?} peer={}", c.outcome, unported(&at)), o.conn)
-            };
-            let after = counts(&p);
-            let crossed = after.0 - before.0;
-            let resumed = after.1 - before.1;
-            assert_eq!(crossed, 1, "{}", "accept");
-            match is("Ready peer=127.0.0.1:*") {
-                Want::Is(expected) => assert_eq!(answer, expected, "{}", "accept"),
-                Want::Starts(prefix) => {
-                    assert!(answer.starts_with(prefix), "{}: {}", "accept", answer)
-                }
-            };
-            results.push((("accept").to_string(), answer, crossed, resumed));
-            value
-        };
-        let want = is("Ready peer=127.0.0.1:* local_port_is_bound=true");
-        {
-            let before = counts(&p);
-            let answer = {
-                let mut peer = vec![0_u8; MAX_ADDR as usize];
-                let mut i: ArrivalIn = input();
-                i.conn = accepted;
-                i.peer_buf = peer.as_mut_ptr();
-                i.peer_cap = peer.len();
-                let (c, o) = go::<_, ArrivalOut>(&p, &rd, false, slot::ARRIVAL, i);
-                let at = lossy(&peer[..(o.peer_written as usize).min(peer.len())]);
-                let port_is_bound = bound.ends_with(&format!(":{}", o.local_port));
-                format!(
-                    "{:?} peer={} local_port_is_bound={port_is_bound}",
-                    c.outcome,
-                    unported(&at)
-                )
-            };
-            let after = counts(&p);
-            let crossed = after.0 - before.0;
-            let resumed = after.1 - before.1;
-            assert_eq!(crossed, 1, "{}", "arrival");
-            match want {
-                Want::Is(expected) => assert_eq!(answer, expected, "{}", "arrival"),
-                Want::Starts(prefix) => {
-                    assert!(answer.starts_with(prefix), "{}: {}", "arrival", answer)
-                }
-            };
-            results.push((("arrival").to_string(), answer, crossed, resumed));
-        };
-        far.write_all(b"from the far end")
-            .expect("the far end writes");
-
-        std::thread::sleep(Duration::from_millis(100));
-        let want = is("Ready bytes=\"from the far end\" end_of_frame=true");
-        {
-            let before = counts(&p);
-            let answer = read(&p, &rd, accepted, false);
-            let after = counts(&p);
-            let crossed = after.0 - before.0;
-            let resumed = after.1 - before.1;
-            assert_eq!(crossed, 1, "{}", "accepted read");
-            match want {
-                Want::Is(expected) => assert_eq!(answer, expected, "{}", "accepted read"),
-                Want::Starts(prefix) => assert!(
-                    answer.starts_with(prefix),
-                    "{}: {}",
-                    "accepted read",
-                    answer
-                ),
-            };
-            results.push((("accepted read").to_string(), answer, crossed, resumed));
-        };
-        {
-            let before = counts(&p);
-            let answer = write(&p, &wr, accepted, b"to the far end");
-            let after = counts(&p);
-            let crossed = after.0 - before.0;
-            let resumed = after.1 - before.1;
-            assert_eq!(crossed, 1, "{}", "accepted write");
-            match is("Ready len=14") {
-                Want::Is(expected) => assert_eq!(answer, expected, "{}", "accepted write"),
-                Want::Starts(prefix) => assert!(
-                    answer.starts_with(prefix),
-                    "{}: {}",
-                    "accepted write",
-                    answer
-                ),
-            };
-            results.push((("accepted write").to_string(), answer, crossed, resumed));
-        };
-        let mut got = [0_u8; 14];
-        let ok = far.read_exact(&mut got).is_ok() && &got == b"to the far end";
-        {
-            let before = counts(&p);
-            let answer = format!("{ok}");
-            let after = counts(&p);
-            let crossed = after.0 - before.0;
-            let resumed = after.1 - before.1;
-            assert_eq!(crossed, 0, "{}", "far end read");
-            match is("true") {
-                Want::Is(expected) => assert_eq!(answer, expected, "{}", "far end read"),
-                Want::Starts(prefix) => {
-                    assert!(answer.starts_with(prefix), "{}: {}", "far end read", answer)
-                }
-            };
-            results.push((("far end read").to_string(), answer, crossed, resumed));
-        };
-        {
-            let before = counts(&p);
-            let answer = shut(&p, &wr, accepted);
-            let after = counts(&p);
-            let crossed = after.0 - before.0;
-            let resumed = after.1 - before.1;
-            assert_eq!(crossed, 1, "{}", "accepted shut");
-            match is("Ready") {
-                Want::Is(expected) => assert_eq!(answer, expected, "{}", "accepted shut"),
-                Want::Starts(prefix) => assert!(
-                    answer.starts_with(prefix),
-                    "{}: {}",
-                    "accepted shut",
-                    answer
-                ),
-            };
-            results.push((("accepted shut").to_string(), answer, crossed, resumed));
-        };
-        let mut rest = Vec::new();
-        let ended = far.read_to_end(&mut rest).is_ok() && rest.is_empty();
-        {
-            let before = counts(&p);
-            let answer = format!("{ended}");
-            let after = counts(&p);
-            let crossed = after.0 - before.0;
-            let resumed = after.1 - before.1;
-            assert_eq!(crossed, 0, "{}", "far end saw the end");
-            match is("true") {
-                Want::Is(expected) => assert_eq!(answer, expected, "{}", "far end saw the end"),
-                Want::Starts(prefix) => assert!(
-                    answer.starts_with(prefix),
-                    "{}: {}",
-                    "far end saw the end",
-                    answer
-                ),
-            };
-            results.push((
-                ("far end saw the end").to_string(),
-                answer,
-                crossed,
-                resumed,
-            ));
-        };
-    }
-
-    let (dest, other) = match &k["dial"] {
-        serde_json::Value::String(a) if a == "authority" => {
-            let at = echo();
-            host.admit(wr.ticket.ticket(), Admission::Dial(vec![at.clone()]));
-            (
-                Dest::authority(&at),
-                Dest::program(
-                    &serde_json::json!({ "program": "@conformance-program", "args": ["echo"] }),
-                ),
-            )
-        }
-        v => {
-            let d = Dest::program(v);
-            host.admit(
-                wr.ticket.ticket(),
-                spawn_admission(&d.program, &d.args, &d.env),
-            );
-            (d, Dest::authority("127.0.0.1:1"))
-        }
-    };
+    let dest = Dest::program(&k["dial"]);
+    host.admit(
+        wr.ticket.ticket(),
+        spawn_admission(&dest.program, &dest.args, &dest.env),
+    );
+    let other = Dest::authority("127.0.0.1:1");
     let conn = {
         let before = counts(&p);
         let (answer, value) = dial(&p, &wr, &dest);

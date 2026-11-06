@@ -11,15 +11,13 @@ use busbar_contract::abi::sdk::Safe;
 use busbar_contract::abi::transport::Ops;
 
 use crate::claims::CLAIM_NAMES;
-pub use crate::meta::KEY;
-use crate::meta::TAIL;
+use crate::meta::{KEY, TAIL};
 use crate::transport::{
     Accept, Adopt, Arrival, Begin, Carried, Detach, Dial, Emit, Encode, Finish, Flush, Ingest,
     Listen, Locate, Read, RefuseFrame, Shut, Timer, Write,
 };
 pub use crate::transport::{
-    FRAME_TOO_LONG, HELD_DOWN, MAX_LINE_BYTES, MAX_QUEUED_BYTES, NOT_A_COUNT, NOT_ONE_LINE,
-    NO_CLOCK, TOO_LONG,
+    FRAME_TOO_LONG, HELD_DOWN, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, NO_CLOCK, TOO_LONG,
 };
 
 busbar_contract::statement_extensions!(

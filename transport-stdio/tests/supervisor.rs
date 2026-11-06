@@ -982,9 +982,10 @@ fn a_delayed_overlapping_end_counts_only_inside_the_newest_crash_window() {
     }
 }
 
-/// (ii) A member dropped and re-added is a new member: a new key, fresh supervision.
+/// (ii) A member dropped and re-added is a new member under a new key: its supervision is fresh
+/// (the retired key's own state is covered by `retired_keys.rs`).
 #[test]
-fn a_member_dropped_and_re_added_is_fresh() {
+fn a_new_member_key_is_fresh() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let c = Carrier::open();
     c.trip(20, "a");
@@ -1094,6 +1095,33 @@ fn an_end_met_without_a_clock_is_counted_once_the_clock_answers() {
     with(|sc| sc.clock_fails = false);
     c.shut(conn);
     c.assert_held_down(60, "a", "the end was counted at the shut");
+}
+
+/// A deferred end's backoff starts when the clock answers (here, at the connection's shut), not at
+/// the member's next dial: a dial after the first backoff has run out spawns.
+#[test]
+fn a_deferred_ends_backoff_runs_from_when_the_clock_answers() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    let (r, conn) = c.dial(62, "a");
+    assert_eq!(r, Outcome::Ready);
+    with(|sc| {
+        sc.ended = true;
+        sc.clock_fails = true;
+    });
+    assert_eq!(
+        c.read(conn),
+        Outcome::Ready,
+        "the program's end reads as its output closing"
+    );
+    with(|sc| sc.clock_fails = false);
+    c.shut(conn);
+    advance(150 * MS);
+    assert_eq!(
+        c.dial(62, "a").0,
+        Outcome::Ready,
+        "the 100 ms backoff began at the shut and has run out"
+    );
 }
 
 /// Full reads of output (the carrier reads 16 KiB at a time) that carry a member's line past the
