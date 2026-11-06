@@ -128,6 +128,7 @@ struct Script {
     write_calls: usize,
     written: Vec<u8>,
     closed: Vec<u64>,
+    close_failure: Option<Outcome>,
 }
 
 static SCRIPT: Mutex<Script> = Mutex::new(Script {
@@ -152,6 +153,7 @@ static SCRIPT: Mutex<Script> = Mutex::new(Script {
     write_calls: 0,
     written: Vec::new(),
     closed: Vec::new(),
+    close_failure: None,
 });
 static ONE: Mutex<()> = Mutex::new(());
 
@@ -236,8 +238,11 @@ extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
 extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
     let i = unsafe { input.cast::<HandleIn>().read() };
-    with(|sc| sc.closed.push(i.handle));
-    answer(out, Outcome::Ready, 0, 0)
+    let outcome = with(|sc| {
+        sc.closed.push(i.handle);
+        sc.close_failure.take().unwrap_or(Outcome::Ready)
+    });
+    answer(out, outcome, 0, 0)
 }
 
 extern "C" fn io_ends(_: HostCtx, _: *const c_void, out: *mut ServiceOut) -> RawOutcome {
@@ -342,6 +347,7 @@ impl Carrier {
             write_calls: 0,
             written: Vec::new(),
             closed: Vec::new(),
+            close_failure: None,
         };
         let io = Box::new(IoSlots {
             ends: report_exits.then_some(io_ends),
@@ -1242,4 +1248,26 @@ fn the_supervisor_fixture_closes_its_remaining_programs_on_drop() {
     assert_eq!(c.dial(91, "a").0, Outcome::Ready);
     drop(c);
     with(|sc| assert_eq!(sc.closed.len(), 1));
+}
+
+#[test]
+fn a_close_retry_never_counts_the_shutdown_as_a_program_crash() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let c = Carrier::open();
+    with(|sc| {
+        sc.ended = false;
+        sc.close_failure = Some(Outcome::Failed);
+    });
+    let (outcome, conn) = c.dial(91, "a");
+    assert_eq!(outcome, Outcome::Ready);
+    assert_eq!(c.shut_why(conn).0, Outcome::Failed);
+    // The host killed the process but failed to release its handle on the first close.
+    with(|sc| sc.parent_exited = true);
+    c.shut(conn);
+    assert_eq!(
+        c.dial(91, "a").0,
+        Outcome::Ready,
+        "cleanup must not impose crash backoff"
+    );
+    with(|sc| assert_eq!(sc.closed, [2, 2]));
 }

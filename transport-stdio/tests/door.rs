@@ -196,6 +196,8 @@ struct Script {
     written: Vec<u8>,
     /// Handles closed.
     closed: Vec<u64>,
+    /// The next close result, then successful closes.
+    close_result: Option<Outcome>,
     /// `Some(k)`: the pipe TRICKLES, taking at most `k` bytes on one `io.write` and answering
     /// PENDING on the next. `None`: it takes everything.
     trickle: Option<usize>,
@@ -296,8 +298,11 @@ extern "C" fn io_write(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -
 extern "C" fn io_close(_: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
     // SAFETY: the carrier's `in`.
     let i = unsafe { input.cast::<HandleIn>().read() };
-    with(|sc| sc.closed.push(i.handle));
-    answer(out, Outcome::Ready, 0, 0)
+    let result = with(|sc| {
+        sc.closed.push(i.handle);
+        sc.close_result.take().unwrap_or(Outcome::Ready)
+    });
+    answer(out, result, 0, 0)
 }
 
 static IO: IoSlots = IoSlots {
@@ -1354,4 +1359,61 @@ fn a_refresh_rechecks_an_inbound_line_already_partly_returned() {
     assert!(bytes.is_empty());
     assert!(!end);
     assert_eq!(why, TOO_LONG);
+}
+
+#[test]
+fn a_failed_close_remains_retryable_but_never_readable() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::new(Vec::new());
+    with(|sc| sc.close_result = Some(Outcome::Failed));
+    let mut input: ShutIn = z();
+    input.conn = h.conn;
+    let mut out: OutHead = z();
+    assert_eq!(
+        call(ops().shut, h.inst, &mut input, &mut out, slot::SHUT),
+        Outcome::Failed
+    );
+    assert_eq!(h.write(b"after shut", true).0, Outcome::Failed);
+    assert_eq!(h.read(8).0, Outcome::Failed);
+    let mut arrival: ArrivalIn = z();
+    arrival.conn = h.conn;
+    let mut arrived: ArrivalOut = z();
+    assert_eq!(
+        call(
+            ops().arrival,
+            h.inst,
+            &mut arrival,
+            &mut arrived,
+            slot::ARRIVAL
+        ),
+        Outcome::Failed
+    );
+    assert_eq!(
+        call(ops().shut, h.inst, &mut input, &mut out, slot::SHUT),
+        Outcome::Ready
+    );
+    assert_eq!(
+        call(ops().shut, h.inst, &mut input, &mut out, slot::SHUT),
+        Outcome::Ready
+    );
+    with(|sc| assert_eq!(sc.closed, [7, 7]));
+}
+
+#[test]
+fn a_host_released_handle_is_forgotten_after_close_refusal() {
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let h = Host::new(Vec::new());
+    with(|sc| sc.close_result = Some(Outcome::Refused));
+    let mut input: ShutIn = z();
+    input.conn = h.conn;
+    let mut out: OutHead = z();
+    assert_eq!(
+        call(ops().shut, h.inst, &mut input, &mut out, slot::SHUT),
+        Outcome::Refused
+    );
+    assert_eq!(
+        call(ops().shut, h.inst, &mut input, &mut out, slot::SHUT),
+        Outcome::Ready
+    );
+    with(|sc| assert_eq!(sc.closed, [7]));
 }

@@ -165,7 +165,7 @@ struct Conn {
     line: Option<Line>,
     /// The program's output ended.
     ended: bool,
-    /// The connection was shut: its handle is closed and it is out of the table.
+    /// The connection was shut: no I/O may run, even while a failed close awaits retry.
     shut: bool,
     /// The frame being written, gathered until its end.
     message: Vec<u8>,
@@ -225,12 +225,12 @@ impl Carried {
     }
 
     /// The connection `token`, taken out of the table for its shut and marked shut under its
-    /// lock: every later op finds no such connection, and so does an op that took it out of the
-    /// table before and waits for its lock.
-    fn forget(&self, token: u64) -> Option<Arc<Mutex<Conn>>> {
+    /// lock: later I/O refuses it, including an op that took it out of the table before and
+    /// waits for its lock. The flag says whether this is a failed-close retry.
+    fn forget(&self, token: u64) -> Option<(Arc<Mutex<Conn>>, bool)> {
         let held = lock(&self.conns).remove(&token)?;
-        lock(&held).shut = true;
-        Some(held)
+        let was_shut = std::mem::replace(&mut lock(&held).shut, true);
+        Some((held, was_shut))
     }
 
     /// Record one end per supervised connection, deferring its timestamp during clock outages.
@@ -671,7 +671,7 @@ impl SafeSlot for Flush {
     }
 }
 
-/// `shut`: the handle is closed (the host kills the program) and the connection forgotten.
+/// `shut`: close the handle and forget it; a failed close retains a shut connection for retry.
 pub struct Shut;
 impl SafeSlot for Shut {
     type In = ShutIn;
@@ -682,25 +682,31 @@ impl SafeSlot for Shut {
             Ok(x) => x,
             Err(r) => return o.fail(r),
         };
-        if let Some(held) = c.forget(i.conn) {
+        if let Some((held, was_shut)) = c.forget(i.conn) {
             let mut conn = lock(&held);
-
-            let open = !conn.ended && !conn.faulted;
-            if conn.key != 0 && !conn.counted && open {
-                match found_ended(&mut io, conn.io) {
-                    Ok(ended) => conn.ended = ended,
-                    Err(e) => {
-                        // An unavailable exit observation is not a running program. Still close
-                        // its handle before reporting the host failure.
-                        let _ = io.close(conn.io);
-                        return o.fail(refusal(&e));
+            let mut observation_error = None;
+            if !was_shut {
+                let open = !conn.ended && !conn.faulted;
+                if conn.key != 0 && !conn.counted && open {
+                    match found_ended(&mut io, conn.io) {
+                        Ok(ended) => conn.ended = ended,
+                        Err(e) => observation_error = Some(e),
                     }
                 }
+                if conn.ended || conn.faulted {
+                    c.ended(&mut conn, now(&inst));
+                }
             }
-            if conn.ended || conn.faulted {
-                c.ended(&mut conn, now(&inst));
+            let closed = io.close(conn.io);
+            drop(conn);
+            // Keep a failed close retryable without allowing another read/write or counting
+            // a program killed by this shut as a supervised crash on the next attempt.
+            if !matches!(closed, Ok(()) | Err(IoFailure::Refused(_))) {
+                lock(&c.conns).insert(i.conn, held);
             }
-            let _ = io.close(conn.io);
+            if let Some(e) = observation_error.or_else(|| closed.err()) {
+                return o.fail(refusal(&e));
+            }
         }
         Outcome::Ready
     }
@@ -720,7 +726,10 @@ impl SafeSlot for Arrival {
         let Some(h) = inst.get() else {
             return o.fail(Refusal::failed("arrival: no open instance"));
         };
-        if h.life().conn(i.conn).is_some() {
+        if h.life()
+            .conn(i.conn)
+            .is_some_and(|conn| live(&conn).is_some())
+        {
             Outcome::Ready
         } else {
             o.fail(Refusal::failed("arrival: no such connection"))
