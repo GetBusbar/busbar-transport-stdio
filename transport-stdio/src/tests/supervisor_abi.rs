@@ -25,6 +25,7 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::sync::{Mutex, PoisonError};
 
+use crate::door::{door, HELD_DOWN, MAX_LINE_BYTES, NO_CLOCK, TOO_LONG};
 use busbar_contract::abi::host::io::{
     HandleIn, IoSlots, ReadIn as IoReadIn, WriteIn as IoWriteIn, SLOTS,
 };
@@ -39,7 +40,6 @@ use busbar_contract::abi::transport::{
     slot, ConnIn, ConnOut, Destination, DialIn, IoOut, Ops, ReadIn, ShutIn, WriteIn, DEST_PROGRAM,
     WRITE_END_OF_FRAME,
 };
-use busbar_transport_stdio::door::{door, HELD_DOWN, MAX_LINE_BYTES, NO_CLOCK, TOO_LONG};
 
 const MS: u64 = 1_000_000;
 
@@ -954,7 +954,7 @@ fn overlapping_handles_of_one_member_count_only_the_pipe_that_ended() {
 #[test]
 fn a_delayed_overlapping_end_counts_only_inside_the_newest_crash_window() {
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
-    let window = busbar_transport_stdio::supervisor::CRASH_WINDOW_NS;
+    let window = crate::supervisor::CRASH_WINDOW_NS;
     for outside in [true, false] {
         let c = Carrier::open();
         with(|sc| sc.mono_ns = 0);

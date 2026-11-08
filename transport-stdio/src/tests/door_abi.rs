@@ -13,6 +13,9 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::sync::{Mutex, PoisonError};
 
+use crate::door::{
+    door, FRAME_TOO_LONG, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, STATEMENT, TOO_LONG,
+};
 use busbar_contract::abi::host::io::{
     HandleIn, IoSlots, ReadIn as IoReadIn, SpawnIn, WriteIn as IoWriteIn, SLOTS,
 };
@@ -33,9 +36,6 @@ use busbar_contract::abi::transport::{
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, TransportTail,
     WriteIn, DEST_AUTHORITY, DEST_PROGRAM, EMIT_TRAILERS, READ_END_OF_FRAME, ROLE_CARRIER,
     SETTING_COUNT, UNIT0_FIRST_LINE, WRITE_END_OF_FRAME,
-};
-use busbar_transport_stdio::door::{
-    door, FRAME_TOO_LONG, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, STATEMENT, TOO_LONG,
 };
 
 fn z<T>() -> T {
@@ -626,10 +626,7 @@ fn a_gathered_frame_at_the_exact_ceiling_succeeds_and_an_oversized_one_leaves_no
     assert_eq!(h.write(&[b'y'; 64], false).0, Outcome::Ready);
     assert_eq!(
         h.write(b"z", false),
-        (
-            Outcome::Failed,
-            busbar_transport_stdio::door::FRAME_TOO_LONG.to_owned()
-        )
+        (Outcome::Failed, crate::door::FRAME_TOO_LONG.to_owned())
     );
     assert_eq!(h.write(b"next", true).0, Outcome::Ready);
     let mut expected = vec![b'x'; 64];
@@ -1217,7 +1214,7 @@ fn an_op_with_no_open_instance_fails_with_its_prefix() {
 #[test]
 fn line_failure_texts_carry_the_op_prefix() {
     assert!(TOO_LONG.starts_with("read: "), "{TOO_LONG}");
-    assert!(busbar_transport_stdio::door::FRAME_TOO_LONG.starts_with("write: "));
+    assert!(crate::door::FRAME_TOO_LONG.starts_with("write: "));
     assert!(NOT_ONE_LINE.starts_with("write: "));
     let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
     let h = Host::new(Vec::new());
@@ -1285,7 +1282,7 @@ fn the_statement_carries_the_declares_document() {
     let bytes = unsafe { std::slice::from_raw_parts(ext.ptr, ext.len) };
     assert_eq!(
         declares(bytes),
-        Some(&include_bytes!("../declares.json")[..]),
+        Some(&include_bytes!("../../declares.json")[..]),
         "declares.json rides the Statement, whole, under its key"
     );
 }

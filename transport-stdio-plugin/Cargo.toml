@@ -26,13 +26,14 @@ busbar-contract = { workspace = true }
 [dev-dependencies]
 # The conformance test loads the linked door and dlopens the built cdylib over the REAL loader:
 # dev-only, never in the shipped artifact. Same pinned rev, so one busbar source resolves.
-busbar-plugin-loader = { workspace = true }
+busbar-plugin-loader = { workspace = true , features = ["test-support"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 busbar-core-connector = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
 
 # Native subprocess used by conformance; excluded from the shipped cdylib.
+busbar-contract = { workspace = true, features = ["test-seal"] }
 [[bin]]
 name = "conformance-program"
 path = "tests/support/program.rs"

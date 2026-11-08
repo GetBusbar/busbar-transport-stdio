@@ -8,8 +8,8 @@ use busbar_contract::abi::mechanism::rendering::{self, RENDERING_MAGIC};
 use busbar_contract::abi::mechanism::KindCode;
 use busbar_contract::abi::transport::{FramePiece, TransportTail};
 use busbar_plugin_loader::dispatch::kinds::{
-    auth::Auth, export::Export, hook::Hook, plane::Plane, secret::Secret, store::Store,
-    transport::Transport,
+    auth::Auth, export::Export, hook::Hook, plane::Plane, secret::Secret,
+    store_v4::StoreV4 as Store, transport::Transport,
 };
 use busbar_plugin_loader::dispatch::{
     load_dropped, load_linked, Dispatcher, Kind, LinkedRow, LoadError,
@@ -51,7 +51,10 @@ pub(super) fn red_a_door_at_another_kind_abi_is_refused() {
     let real = actual();
     let host = KindCode::Transport.abi_version();
     assert_eq!(real.kind_abi, host);
-    let d = Dispatcher::new(Default::default());
+    let d = Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     for abi in [host + 1, host.wrapping_sub(1)] {
         change(DoorParts {
             kind_abi: abi,
@@ -84,7 +87,10 @@ pub(super) fn red_a_door_built_against_another_kind_layout_is_refused() {
     let kind = KindCode::Transport;
     let host = kind.layout_fingerprint();
     assert_eq!(real.layout, host);
-    let d = Dispatcher::new(Default::default());
+    let d = Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     for stated in [host ^ 1, 0] {
         change(DoorParts {
             layout: stated,
@@ -122,7 +128,10 @@ pub(super) fn red_a_door_built_against_another_kind_layout_is_refused() {
 pub(super) fn red_a_transport_built_against_another_frame_piece_is_refused() {
     let _guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let real = actual();
-    let d = Dispatcher::new(Default::default());
+    let d = Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     // SAFETY: the loaded real transport provides a complete static Statement and TransportTail.
     let st = unsafe { real.statement.read_unaligned() };
     let tail = unsafe { st.kind_tail.cast::<TransportTail>().read_unaligned() };
@@ -161,7 +170,10 @@ pub(super) fn red_a_transport_built_against_another_frame_piece_is_refused() {
 pub(super) fn red_a_statement_other_than_the_stated_one_is_refused() {
     let _guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let real = actual();
-    let d = Dispatcher::new(Default::default());
+    let d = Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     // SAFETY: the genuine door's complete immutable static statement was validated above.
     let st = unsafe { real.statement.read_unaligned() };
     let st = Box::leak(Box::new(Statement {
@@ -218,12 +230,15 @@ pub(super) fn red_a_failing_ready_refuses_the_boot() {
         ready: Some(fail_ready),
         ..actual()
     });
-    let d = Dispatcher::new(Default::default());
+    let d = Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let r = LinkedRow::of_raw(changed_door).unwrap();
     let p = load_linked::<Transport>(&r, bind(&d)).unwrap();
     assert!(p.has_ready());
     super::open(&p);
-    let before = p.inner.crossings.load(Ordering::SeqCst) - p.inner.resumes.load(Ordering::SeqCst);
+    let before = p.test_invocations().0 - p.test_invocations().1;
     assert_eq!(
         p.ready(&d, std::time::Duration::from_secs(30)).unwrap_err(),
         format!(
@@ -231,14 +246,14 @@ pub(super) fn red_a_failing_ready_refuses_the_boot() {
             p.name()
         )
     );
-    assert_eq!(
-        p.inner.crossings.load(Ordering::SeqCst) - p.inner.resumes.load(Ordering::SeqCst) - before,
-        1
-    );
+    assert_eq!(p.test_invocations().0 - p.test_invocations().1 - before, 1);
     assert_eq!(READY_CALLS.load(Ordering::SeqCst), 1);
 }
 fn wrong_kind<K: Kind>(want: KindCode) {
-    let d = Dispatcher::new(Default::default());
+    let d = Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     assert_eq!(
         load_linked::<K>(&row(), bind(&d)).err(),
         Some(LoadError::ManifestKind {
@@ -293,7 +308,10 @@ pub(super) fn red_a_networked_door_with_no_connection_table_is_refused() {
     }));
     change(DoorParts { statement, ..real });
     let row = LinkedRow::of_raw(changed_door).unwrap();
-    let d = Dispatcher::new(Default::default());
+    let d = Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let plugin = rendering::read(&row.statement).unwrap().name;
     let refused = load_linked::<Transport>(&row, bind(&d)).err().unwrap();
     assert_eq!(

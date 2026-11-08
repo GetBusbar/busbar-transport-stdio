@@ -178,6 +178,7 @@ struct Conn {
 type State = Held<Carried>;
 
 impl Life for Carried {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     /// A PENDING carrier op moved nothing, so a cancel finds nothing moved.
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
@@ -205,7 +206,7 @@ impl Life for Carried {
     /// `close` (the instance's): every connection handle still held is closed through the host's
     /// I/O, errors ignored (the host kills a spawned program with its handle); the SDK answers
     /// READY and drops the state.
-    fn close(&self, host: Option<&Host>) {
+    fn close(&self, host: Option<&Host<busbar_contract::plugin::markers::TransportKind>>) {
         let conns: Vec<_> = lock(&self.conns).drain().map(|(_, c)| c).collect();
         if let Some(mut io) = host.map(|h| h.io(Ticket::NONE)).filter(Io::armed) {
             for conn in conns {
@@ -283,7 +284,7 @@ impl Carried {
 }
 
 /// The host's monotonic clock now; `None` when the host lends no clock or its clock fails.
-fn now(i: &Instance<'_, State>) -> Option<u64> {
+fn now(i: &Instance<'_, State, busbar_contract::plugin::markers::TransportKind>) -> Option<u64> {
     let services = i.get()?.host()?.services()?;
     let handle = CompletionHandle {
         ticket: i.ticket(),
@@ -464,10 +465,15 @@ busbar_contract::not_served! {
 /// `dial`: spawn the program, through the host. An authority is not this carrier's destination.
 pub struct Dial;
 impl SafeSlot for Dial {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = DialIn;
     type Out = ConnOut;
     type State = State;
-    fn call(inst: Instance<'_, State>, i: Lent<'_, DialIn>, mut o: Out<'_, ConnOut>) -> Outcome {
+    fn call(
+        inst: Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
+        i: Lent<'_, DialIn>,
+        mut o: Out<'_, ConnOut>,
+    ) -> Outcome {
         let Some(dest) = i.dest() else {
             return o.fail(Refusal::failed("dial: no destination"));
         };
@@ -530,10 +536,15 @@ impl SafeSlot for Dial {
 /// `read`: the next line, or the rest of the one being answered, into the host's buffer.
 pub struct Read;
 impl SafeSlot for Read {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = ReadIn;
     type Out = IoOut;
     type State = State;
-    fn call(inst: Instance<'_, State>, i: Lent<'_, ReadIn>, mut o: Out<'_, IoOut>) -> Outcome {
+    fn call(
+        inst: Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
+        i: Lent<'_, ReadIn>,
+        mut o: Out<'_, IoOut>,
+    ) -> Outcome {
         over!("read", inst, o, i.conn, |carried, io, c| {
             let mut buf = i.buf();
             let max = carried.ceiling();
@@ -597,10 +608,15 @@ impl SafeSlot for Read {
 /// the pipe takes them.
 pub struct Write;
 impl SafeSlot for Write {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = WriteIn;
     type Out = IoOut;
     type State = State;
-    fn call(inst: Instance<'_, State>, i: Lent<'_, WriteIn>, mut o: Out<'_, IoOut>) -> Outcome {
+    fn call(
+        inst: Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
+        i: Lent<'_, WriteIn>,
+        mut o: Out<'_, IoOut>,
+    ) -> Outcome {
         let bytes = i.bytes();
         let end = i.flags & WRITE_END_OF_FRAME != 0;
         over!("write", inst, o, i.conn, |carried, io, c| {
@@ -654,10 +670,15 @@ impl SafeSlot for Write {
 /// `flush`: what is queued, written: READY once the pipe took it all.
 pub struct Flush;
 impl SafeSlot for Flush {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = ConnIn;
     type Out = OutHead;
     type State = State;
-    fn call(inst: Instance<'_, State>, i: Lent<'_, ConnIn>, mut o: Out<'_, OutHead>) -> Outcome {
+    fn call(
+        inst: Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
+        i: Lent<'_, ConnIn>,
+        mut o: Out<'_, OutHead>,
+    ) -> Outcome {
         over!("flush", inst, o, i.conn, |carried, io, c| {
             match c.drain(&mut io) {
                 Poll::Pending => Outcome::Pending,
@@ -674,10 +695,15 @@ impl SafeSlot for Flush {
 /// `shut`: close the handle and forget it; a failed close retains a shut connection for retry.
 pub struct Shut;
 impl SafeSlot for Shut {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = ShutIn;
     type Out = OutHead;
     type State = State;
-    fn call(inst: Instance<'_, State>, i: Lent<'_, ShutIn>, mut o: Out<'_, OutHead>) -> Outcome {
+    fn call(
+        inst: Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
+        i: Lent<'_, ShutIn>,
+        mut o: Out<'_, OutHead>,
+    ) -> Outcome {
         let (c, mut io) = match carried!(inst, "shut") {
             Ok(x) => x,
             Err(r) => return o.fail(r),
@@ -715,11 +741,12 @@ impl SafeSlot for Shut {
 /// `arrival`: a program has no far end and arrived on no port.
 pub struct Arrival;
 impl SafeSlot for Arrival {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = ArrivalIn;
     type Out = ArrivalOut;
     type State = State;
     fn call(
-        inst: Instance<'_, State>,
+        inst: Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, ArrivalIn>,
         mut o: Out<'_, ArrivalOut>,
     ) -> Outcome {

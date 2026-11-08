@@ -16,6 +16,7 @@ use crate::transport::{
     Accept, Adopt, Arrival, Begin, Carried, Detach, Dial, Emit, Encode, Finish, Flush, Ingest,
     Listen, Locate, Read, RefuseFrame, Shut, Timer, Write,
 };
+#[cfg(test)]
 pub use crate::transport::{
     FRAME_TOO_LONG, HELD_DOWN, MAX_LINE_BYTES, NOT_A_COUNT, NOT_ONE_LINE, NO_CLOCK, TOO_LONG,
 };

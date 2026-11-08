@@ -66,8 +66,8 @@ fn bind(d: &Dispatcher) -> Bind {
     }
 }
 fn counts(p: &Plugin<Transport>) -> (u64, u64) {
-    let resumes = p.inner.resumes.load(Ordering::SeqCst);
-    (p.inner.crossings.load(Ordering::SeqCst) - resumes, resumes)
+    let resumes = p.test_invocations().1;
+    (p.test_invocations().0 - resumes, resumes)
 }
 fn artifact() -> std::path::PathBuf {
     let exe = std::env::current_exe().unwrap();
@@ -318,10 +318,13 @@ enum Want {
 fn carrier(dropped: bool) -> Vec<(String, String, u64, u64)> {
     let inputs: serde_json::Value = serde_json::from_str(include_str!("conformance.json")).unwrap();
     let k = &inputs["transport"]["carrier"];
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let host = Arc::new(HostIo::default());
     assert!(d.install_io(Arc::clone(&host) as _));
-    let row = LinkedRow::of(busbar_transport_stdio::door::door).unwrap();
+    let row = LinkedRow::of(busbar_transport_stdio::door).unwrap();
     let p = if dropped {
         let path = artifact();
         assert_eq!(
@@ -913,7 +916,7 @@ fn the_linked_and_the_dropped_in_door_are_one_plugin() {
 }
 #[test]
 fn the_statement_carries_the_declares_document() {
-    let row = LinkedRow::of(busbar_transport_stdio::door::door).unwrap();
+    let row = LinkedRow::of(busbar_transport_stdio::door).unwrap();
     let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
     assert_eq!(
         busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
@@ -956,7 +959,7 @@ fn read(p: &Plugin<Transport>, side: &Side, conn: u64, resume: bool) -> String {
 }
 
 fn row() -> LinkedRow {
-    LinkedRow::of(busbar_transport_stdio::door::door).unwrap()
+    LinkedRow::of(busbar_transport_stdio::door).unwrap()
 }
 fn cdylib() -> std::path::PathBuf {
     artifact()

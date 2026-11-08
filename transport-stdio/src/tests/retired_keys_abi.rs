@@ -120,7 +120,7 @@ static IO: IoSlots = IoSlots {
 
 fn ops() -> &'static Ops {
     // SAFETY: this carrier exports a static transport door with a transport Ops table.
-    unsafe { &*(*busbar_transport_stdio::door::door()).ops().cast::<Ops>() }
+    unsafe { &*(*crate::door()).ops().cast::<Ops>() }
 }
 
 fn call<I, O>(
@@ -201,7 +201,7 @@ impl Opened {
     }
 
     fn trip(&self, key: u64) {
-        for _ in 0..busbar_transport_stdio::supervisor::CRASH_THRESHOLD {
+        for _ in 0..crate::supervisor::CRASH_THRESHOLD {
             with(|script| script.mono_ns += 1_000_000_000);
             assert_eq!(self.dial(DEST_PROGRAM, key).0, Outcome::Failed);
         }
