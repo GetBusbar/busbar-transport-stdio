@@ -36,4 +36,3 @@ mod supervisor_abi;
 mod retired_keys_abi;
 
 // Source-owned integration tests are compiled only by the assembling host test harness.
-include!(concat!(env!("OUT_DIR"), "/context_test_source.rs"));
